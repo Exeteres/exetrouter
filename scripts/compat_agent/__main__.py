@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 
-from .core import GitHub, Ledger, Stop, collect, digest
+from .core import GitHub, Ledger, Stop, collect, digest, review_batch
 from .model import Model
 from .sandbox import CHECKS, Sandbox, command
 
@@ -38,11 +38,20 @@ def publish(gh, event, base, key, files, report):
     # Never overwrite an existing branch, even after an uncertain write.
     gh.own("git/refs", "POST", {"ref": "refs/heads/" + branch, "sha": commit["sha"]})
     body += "\n\n" + marker + "\n\nAutomated compatibility proposal. No live upstream tests were run. Full platform CI is pending."
+    if "batch" in event:
+        body += ("\nSource review batch " + str(event["batch"]["index"]) + " of "
+                 + str(event["batch"]["count"]) + ". This proposal covers only this batch's findings.")
     if event["version"] is None:
         body += "\nThis proposal targets unreleased upstream source."
     pr = gh.own("pulls", "POST", {"title": title, "body": body,
                                   "base": "main", "head": branch, "draft": event["version"] is None})
     return pr["number"]
+
+
+def paused():
+    print("compat_agent: review_paused", flush=True)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print("::warning::Compatibility scan needs human review. Inspect automation/upstream-state before resuming.")
 
 
 def main():
@@ -58,7 +67,7 @@ def main():
         raise Stop("untrusted_checkout")
     manifest = json.loads((root / "docs/protocol-sources.json").read_text())
     ledger = Ledger(gh)
-    events = collect(gh, manifest, ledger.value["cursors"])
+    events = collect(gh, manifest, ledger.value["cursors"], ledger.value.get("scans", {}))
     if not events:
         print("compat_agent: no_drift")
         return
@@ -81,7 +90,6 @@ def main():
             box.close()
         return
     model = Model(root)
-    model.preflight()
     policy = digest({p.relative_to(root).as_posix(): p.read_text()
                      for directory in ("prompts/compat-agent", "scripts/compat_agent")
                      for p in sorted((root / directory).glob("*")) if p.is_file()})
@@ -95,19 +103,23 @@ def main():
                 # Queue later source changes while a proposal is open; a human's
                 # rejection is sticky until the operator explicitly clears it.
                 held.add(attempt.get("repository"))
-    # One bounded package per run; later observations remain queued via cursors.
+    # One bounded batch per run; frozen snapshots retain progress across runs.
     blocked = False
     for event in events:
         if event["repository"] in held:
             continue
-        key = digest({"event": event, "policy": policy})
-        if key in ledger.value["attempts"]:
-            # Stable and branch tracks sharing the same source revision are deduplicated.
+        scan = None
+        if not event.get("blocked"):
+            scan, event = review_batch(event, ledger.value.get("scans", {}).get(event["track"]))
+        key = digest({"event": event, "policy": policy, "scan": scan["id"] if scan else None})
+        if key in ledger.value["attempts"] or ledger.attempted(event, scan):
+            if event["track"] in ledger.value.get("scans", {}):
+                paused()
             continue
-        if any(a["sha"] == event["after"] and a["status"] in {"published", "started", "uncertain", "blocked"}
-               for a in ledger.value["attempts"].values()):
-            continue
-        if not args.dry_run and not ledger.claim(key, event["track"], event["after"], event["repository"]):
+        if not event.get("blocked"):
+            model.preflight()
+        if not args.dry_run and not ledger.claim(
+                key, event["track"], event["after"], event["repository"], scan=scan):
             continue
         if event.get("blocked"):
             blocked = True
@@ -117,6 +129,10 @@ def main():
             continue
         box = Sandbox(root, gh, event, base)
         try:
+            print("compat_agent: batch=" + str(event["batch"]["index"])
+                  + " batches=" + str(event["batch"]["count"])
+                  + " files=" + str(len(event["files"]))
+                  + " total_files=" + str(event["batch"]["total_files"]), flush=True)
             contracts = {p: box.local(p) for p in (
                 "AGENTS.md", "SECURITY.md", "docs/openai-api.md", "docs/upstream-contract.md",
                 "docs/account-pool.md", "docs/compatibility.md")}
@@ -124,7 +140,9 @@ def main():
                        "contracts": contracts}
             triage = model.run("triage", context, box)
             status = triage["decision"]
-            if event["version"] is not None and status != "needs_human":
+            last_batch = event["batch"]["index"] == event["batch"]["count"]
+            if (event["version"] is not None and status != "needs_human"
+                    and (status != "no_change" or last_batch)):
                 box.prepare_native()
                 box.start()
                 native_before = box.native_check()
@@ -164,6 +182,8 @@ def main():
                     reviewed = model.run("review", {**context, "confirmed": verified,
                         "diff": diffs, "checks": box.results, "proposal": built,
                         "red_observed": box.red_observed}, box)
+                    if reviewed["decision"] == "needs_human":
+                        raise Stop("review_needs_human")
                     if reviewed["decision"] != "approve":
                         raise Stop("review_not_approved")
                     # PR text uses the same credential/endpoint publication rules as code.
@@ -183,11 +203,19 @@ def main():
                         return
             if not args.dry_run:
                 ledger.finish(key, status if status in {"no_change", "rejected"} else "blocked")
-            print("compat_agent: " + status)
+            if status == "needs_human":
+                paused()
+            print("compat_agent: " + ("batch_complete" if not last_batch
+                                     and status in {"no_change", "rejected"} else status))
             return
-        except Exception:
+        except Exception as error:
+            human = isinstance(error, Stop) and str(error) in {
+                "implementation_needs_human", "review_needs_human"}
             if not args.dry_run:
-                ledger.finish(key, "uncertain")
+                ledger.finish(key, "blocked" if human else "uncertain")
+            if human:
+                paused()
+                return
             raise
         finally:
             box.close()

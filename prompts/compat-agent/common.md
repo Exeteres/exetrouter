@@ -16,4 +16,9 @@ Use read_files to batch related evidence reads (up to eight ranges per turn).
 Reads default to 200 lines; use explicit start_line/line_count to inspect later
 ranges, and never mistake truncated output for complete evidence. Plan your
 bounded tool budget and finish with submit_decision before it expires; use
-needs_human with complete coverage of the evidence limitation if necessary.
+needs_human with coverage_complete=false when evidence is incomplete. This pauses
+the scan for human review; it never means compatibility has been established.
+The controller supplies one bounded batch from frozen before/after snapshots.
+Coverage applies to this batch and its relevant dependencies, not unseen batches.
+Read other pinned files as needed to understand cross-file effects. Earlier or
+later batches are not evidence that a finding is already fixed.

@@ -106,6 +106,99 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(Stop):
             decision("triage", good)
 
+    def test_incomplete_evidence_can_request_human_review_only(self):
+        for phase, kinds in (("triage", ("no_change", "docs_only", "code_change")),
+                             ("verify", ("confirmed", "rejected")),
+                             ("implement", ("ready",)),
+                             ("review", ("approve", "request_changes"))):
+            value = {**verdict("needs_human"), "coverage_complete": False}
+            self.assertEqual(decision(phase, value), value)
+            for kind in kinds:
+                with self.subTest(phase=phase, kind=kind), self.assertRaisesRegex(Stop, "incomplete_coverage"):
+                    decision(phase, {**value, "decision": kind})
+        for invalid in (None, 0, "false"):
+            with self.assertRaises(Stop):
+                decision("triage", {**value, "coverage_complete": invalid})
+        with self.assertRaisesRegex(Stop, "invalid_summary"):
+            decision("triage", {**value, "summary": None})
+
+    def test_large_scan_covers_every_file_once_without_blob_hashes_in_context(self):
+        from scripts.compat_agent.core import review_batch
+        event = observation(3182)
+        state = Ledger(FakeGH())
+        seen = []
+        while True:
+            plan, batch = review_batch(event, state.value.get("scans", {}).get("codex"))
+            self.assertLessEqual(len(batch["files"]), 32)
+            self.assertLess(len(json.dumps(batch)), 16000)
+            self.assertNotIn('"sha"', json.dumps(batch["files"]))
+            seen.extend(f["filename"] for f in batch["files"])
+            self.assertTrue(state.claim(str(len(seen)), "codex", NEW, "openai/codex", scan=plan))
+            state.finish(str(len(seen)), "no_change")
+            if batch["batch"]["index"] == batch["batch"]["count"]:
+                break
+            self.assertNotIn("codex", state.value["cursors"])
+        self.assertEqual(seen, [f["filename"] for f in event["files"]])
+        self.assertEqual(state.value["cursors"], {"codex": NEW})
+        self.assertEqual(state.value["scans"], {})
+
+    def test_batch_keeps_modes_and_rejects_changed_frozen_inventory(self):
+        from scripts.compat_agent.core import review_batch
+        event = observation(33)
+        event["files"][0]["after"]["mode"] = "100755"
+        plan, batch = review_batch(event)
+        self.assertEqual(batch["files"][0]["before"]["mode"], "100644")
+        self.assertEqual(batch["files"][0]["after"]["mode"], "100755")
+        event["files"][-1]["after"]["sha"] = "c" * 40
+        with self.assertRaisesRegex(Stop, "scan_changed"):
+            review_batch(event, plan)
+
+    def test_failed_batch_cannot_be_retried_with_a_new_policy(self):
+        from scripts.compat_agent.core import review_batch
+        event = observation(33)
+        for status in ("started", "uncertain", "blocked"):
+            state = Ledger(FakeGH())
+            plan, _ = review_batch(event)
+            self.assertTrue(state.claim("old_policy", "codex", NEW, "openai/codex", scan=plan))
+            if status != "started":
+                state.finish("old_policy", status)
+            self.assertFalse(state.claim("new_policy", "codex", NEW, "openai/codex", scan=plan))
+            self.assertEqual(state.value["scans"]["codex"]["next_batch"], 0)
+            self.assertEqual(state.value["cursors"], {})
+
+    def test_failed_progress_write_keeps_batch_pending(self):
+        from scripts.compat_agent.core import review_batch
+        state = Ledger(FakeGH())
+        plan, _ = review_batch(observation(33))
+        state.claim("key", "codex", NEW, "openai/codex", scan=plan)
+        with patch.object(state, "save", side_effect=Stop("http_503")), self.assertRaises(Stop):
+            state.finish("key", "no_change")
+        state.finish("key", "uncertain")
+        self.assertEqual(state.gh.state["scans"]["codex"]["next_batch"], 0)
+        self.assertEqual(state.gh.state["attempts"]["key"]["status"], "uncertain")
+        self.assertEqual(state.value["cursors"], {})
+
+    def test_legacy_uncertain_attempt_is_not_retried_as_a_batch(self):
+        from scripts.compat_agent.core import review_batch
+        state = Ledger(FakeGH())
+        state.claim("legacy", "codex", NEW, "openai/codex")
+        state.finish("legacy", "uncertain")
+        plan, _ = review_batch(observation(33))
+        self.assertFalse(state.claim("batched", "codex", NEW, "openai/codex", scan=plan))
+        self.assertNotIn("scans", state.value)
+
+    def test_partial_publication_does_not_advance_whole_snapshot_cursor(self):
+        from scripts.compat_agent.core import review_batch
+        state = Ledger(FakeGH())
+        event = observation(33)
+        plan, _ = review_batch(event)
+        state.claim("key", "codex", NEW, "openai/codex", scan=plan)
+        state.finish("key", "published", 42)
+        self.assertEqual(state.value["attempts"]["key"]["pr"], 42)
+        self.assertEqual(state.value["scans"]["codex"]["next_batch"], 1)
+        self.assertEqual(state.value["cursors"], {})
+        self.assertTrue(state.attempted({**event, "track": "openai/codex:branch"}))
+
     def test_hash_canonical(self):
         self.assertEqual(digest({"a": 1, "b": 2}), digest({"b": 2, "a": 1}))
 
@@ -209,6 +302,31 @@ class PolicyTests(unittest.TestCase):
             events = collect(gh, manifest, {})
         self.assertTrue(all(e.get("blocked") == "change_inventory_too_large" for e in events))
 
+    def test_collect_keeps_pending_snapshot_when_new_upstream_versions_arrive(self):
+        from scripts.compat_agent.core import review_batch
+        event = observation(33)
+        plan, _ = review_batch(event)
+        gh = FakeGH()
+        gh.api = lambda path: {"default_branch": "dev"}
+        gh.resolve = lambda *a: "c" * 40
+        old = {f["filename"]: f["before"] for f in event["files"]}
+        new = {f["filename"]: f["after"] for f in event["files"]}
+        gh.tree = lambda repo, sha: old if sha == SHA else new
+        manifest = {"projects": [{"id": i, "commit": SHA} for i in ("codex", "opencode", "opencode-v1")]}
+        with patch("scripts.compat_agent.core.request", return_value={"version": "2.0.0"}):
+            events = collect(gh, manifest, {}, {"codex": plan})
+        frozen = next(e for e in events if e["track"] == "codex")
+        self.assertEqual(frozen, event)
+
+
+def observation(count=1):
+    return {"track": "codex", "repository": "openai/codex", "before": SHA,
+            "after": NEW, "version": "1.0.0", "comparison": "exact_source_trees",
+            "files": [{"filename": f"src/example{i:04d}.rs", "status": "modified",
+                       "before": {"sha": SHA, "mode": "100644", "type": "blob"},
+                       "after": {"sha": NEW, "mode": "100644", "type": "blob"}}
+                      for i in range(count)]}
+
 
 class FakeBox:
     def __init__(self):
@@ -279,6 +397,16 @@ class ModelTests(unittest.TestCase):
             **verdict("confirmed"), "findings": [finding()]}))
         with self.assertRaisesRegex(Stop, "citation_not_found"):
             model.run("verify", {}, box, triage={})
+
+    def test_independent_incomplete_verdict_stops_before_triage_reveal(self):
+        value = {**verdict("needs_human"), "coverage_complete": False}
+        calls = []
+        def api(url, token, method, body):
+            calls.append(copy.deepcopy(body))
+            return self.response("submit_preliminary", value)
+        self.assertEqual(Model(ROOT, api).run("verify", {}, FakeBox(), triage={"private_marker": True}), value)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("private_marker", json.dumps(calls))
 
     def test_medium_cannot_edit(self):
         requests = []
@@ -365,6 +493,99 @@ class ModelTests(unittest.TestCase):
                     "https://api.example.com/v1?token=secret"):
             with patch.dict(os.environ, {"COMPAT_API_BASE_URL": url}), self.assertRaises(Stop):
                 Model(ROOT)
+
+
+class FlowTests(unittest.TestCase):
+    def run_agent(self, ledger, event, result, dry_run=False):
+        from importlib import import_module
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        module = import_module("scripts.compat_agent.__main__")
+        box, model = Mock(), Mock()
+        box.local.return_value = "Synthetic trusted contract"
+        box.native_check.return_value = {"passed": True, "categories": ["passed"], "observations": []}
+        box.check.return_value = {"passed": True}
+        box.bundle.return_value = {"docs/example.md": "Synthetic documentation"}
+        box.inventory = []
+        box.results = {}
+        results = list(result) if isinstance(result, list) else [result]
+        def review(*args, **kwargs):
+            if not dry_run:
+                self.assertTrue(any(a["status"] == "started" for a in ledger.gh.state["attempts"].values()))
+                self.assertIn("codex", ledger.gh.state["scans"])
+            return decision(args[0], results.pop(0))
+        model.run.side_effect = review
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": ledger.gh.repo,
+                                     "COMPAT_GITHUB_TOKEN": "synthetic"}), \
+                patch.object(sys, "argv", ["compat_agent"] + (["--dry-run"] if dry_run else [])), \
+                patch.object(module, "GitHub", return_value=ledger.gh), \
+                patch.object(module, "Ledger", return_value=ledger), \
+                patch.object(module, "command", return_value=SimpleNamespace(stdout=SHA.encode())), \
+                patch.object(module, "collect", return_value=[event]), \
+                patch.object(module, "Sandbox", return_value=box), \
+                patch.object(module, "Model", return_value=model), patch("builtins.print"):
+            module.main()
+        return model, box
+
+    def test_scan_resumes_from_durable_batch_and_checks_native_before_final_cursor(self):
+        ledger = Ledger(FakeGH())
+        event = observation(33)
+        model, box = self.run_agent(ledger, event, verdict())
+        self.assertEqual(model.run.call_args.args[1]["event"]["batch"]["index"], 1)
+        box.native_check.assert_not_called()
+        self.assertEqual(ledger.value["cursors"], {})
+        ledger.gh.head = NEW
+        resumed = Ledger(ledger.gh)
+        model, box = self.run_agent(resumed, event, verdict())
+        self.assertEqual(model.run.call_args.args[1]["event"]["batch"]["index"], 2)
+        box.native_check.assert_called_once()
+        self.assertEqual(resumed.value["cursors"], {"codex": NEW})
+        self.assertEqual(resumed.value["scans"], {})
+
+    def test_needs_human_pauses_without_native_probe_or_repeat_inference(self):
+        ledger = Ledger(FakeGH())
+        event = observation(33)
+        model, box = self.run_agent(ledger, event, {**verdict("needs_human"), "coverage_complete": False})
+        box.native_check.assert_not_called()
+        self.assertEqual(ledger.value["scans"]["codex"]["next_batch"], 0)
+        self.assertEqual(next(iter(ledger.value["attempts"].values()))["status"], "blocked")
+        model, box = self.run_agent(ledger, event, verdict())
+        model.preflight.assert_not_called()
+        model.run.assert_not_called()
+        self.assertEqual(ledger.value["cursors"], {})
+
+    def test_incomplete_success_still_fails_and_keeps_scan_pending(self):
+        ledger = Ledger(FakeGH())
+        event = observation(33)
+        with self.assertRaisesRegex(Stop, "incomplete_coverage"):
+            self.run_agent(ledger, event, {**verdict(), "coverage_complete": False})
+        self.assertEqual(ledger.value["scans"]["codex"]["next_batch"], 0)
+        self.assertEqual(next(iter(ledger.value["attempts"].values()))["status"], "uncertain")
+        model, _ = self.run_agent(ledger, event, verdict())
+        model.run.assert_not_called()
+        self.assertEqual(ledger.value["cursors"], {})
+
+    def test_later_needs_human_verdicts_pause_without_publishing(self):
+        for phase in ("implement", "review"):
+            with self.subTest(phase=phase):
+                ledger = Ledger(FakeGH())
+                results = [{**verdict("docs_only"), "findings": [finding()]},
+                           {**verdict("confirmed"), "findings": [finding()]}]
+                if phase == "review":
+                    results.append(verdict("ready"))
+                results.append({**verdict("needs_human"), "coverage_complete": False})
+                model, _ = self.run_agent(ledger, observation(33), results)
+                self.assertEqual(model.run.call_args.args[0], phase)
+                self.assertEqual(next(iter(ledger.value["attempts"].values()))["status"], "blocked")
+                self.assertEqual(ledger.value["scans"]["codex"]["next_batch"], 0)
+                self.assertEqual(ledger.value["cursors"], {})
+                self.assertFalse(any(path == "pulls" for path, _, _ in ledger.gh.writes))
+
+    def test_dry_run_does_not_save_scan_or_advance_progress(self):
+        ledger = Ledger(FakeGH())
+        self.run_agent(ledger, observation(33), verdict(), dry_run=True)
+        self.assertEqual(ledger.gh.writes, [])
+        self.assertEqual(ledger.value, {"schema": 1, "cursors": {}, "attempts": {}})
 
 
 class SandboxTests(unittest.TestCase):

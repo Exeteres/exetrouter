@@ -5,8 +5,11 @@ commits and npm stable release tracks (Codex, OpenCode V2 and V1). It pins sourc
 SHAs and compares complete recursive source trees, including blob IDs and modes.
 This is an exact snapshot comparison, not GitHub Compare's capped merge-base
 diff: legitimate release-branch divergence does not block analysis. Truncated
-trees or oversized inventories stop analysis. The model reads relevant files at
-both revisions. A new release alone is not a reason for a patch.
+trees or oversized inventories stop analysis. The controller freezes both source
+revisions and reviews at most 32 changed files per run, in source-path order.
+The model receives paths, change types and file modes, rather than thousands of
+blob hashes. It reads relevant files at both revisions, including dependencies
+outside the current batch. A new release alone is not a reason for a patch.
 
 ## Decisions and publication
 
@@ -73,10 +76,23 @@ diagnostic categories and tool names are restricted to fixed allowlists.
 `automation/upstream-state` is a metadata-only orphan branch with atomic
 fast-forward updates. It records cursors, policy fingerprints, attempt statuses,
 source SHA and PR number, not transcripts or model-generated explanations.
+Pending scans store frozen revisions, an inventory digest and numeric batch
+progress. New upstream commits do not replace an unfinished scan. The scan cursor
+advances only after every batch is accepted; an intermediate `batch_complete`
+does not claim full compatibility. Partial PRs identify their batch and still
+hold later work until merged. Stable scans require the native baseline before
+their final negative result, as well as before any proposed change.
 The attempt is persisted before inference. Interrupted/uncertain/blocked attempts
 are not retried automatically, including after runner termination. Inspect the
 attempt and remote branches/PRs before explicitly removing a state entry for a
 new attempt. There is no blind retry override. State must not be deleted casually.
+`needs_human` may have `coverage_complete=false`; it records a blocked batch and
+emits an Actions warning instead of crashing. Other verdicts still require full
+relevant batch coverage. Blocked or uncertain batches pause their frozen scan,
+including when newer upstream commits arrive or the automation policy changes.
+After reviewing the cause, remove only the affected attempt to authorize a retry
+of the same batch, preserving its scan and earlier progress. Legacy attempts
+remain protected from automatic retries.
 An open proposal holds later changes for that upstream repository to avoid
 duplicate fixes. A human-closed, unmerged proposal also holds that repository
 until the operator explicitly clears its published attempt after review.
@@ -97,8 +113,9 @@ A failing native baseline escalates even a negative medium verdict to
 independent xhigh verification. A released patch must also pass native validation.
 No real OAuth/reset/deployment operations are exposed to the model.
 
-Limits: one package per run, 64 model requests, 2,000,000 confirmed input/output
-tokens, 16 turns per analysis/verification session, 12 review turns, 24 coding turns, 20 changed files,
+Limits: one batch of at most 32 changed files per run, 64 model requests,
+2,000,000 confirmed input/output tokens, 16 turns per analysis/verification session,
+12 review turns, 24 coding turns, 20 changed files,
 512 KiB total proposed source, and a 60-minute workflow timeout. Unknown usage
 prevents another inference call. Overflow, missing evidence, unknown capabilities,
 failed checks or a moved target base stop publication. No raw session artifacts

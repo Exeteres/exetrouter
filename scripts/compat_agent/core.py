@@ -1,5 +1,6 @@
 """Trusted API, state and policy boundaries. No payload logging."""
 import base64
+import copy
 import hashlib
 import json
 import re
@@ -11,6 +12,7 @@ from pathlib import PurePosixPath
 STATE_BRANCH = "automation/upstream-state"
 MODEL = "gpt-6.1-sol"
 MAX_BYTES = 4 * 1024 * 1024
+MAX_BATCH_FILES = 32
 TRACKS = {
     "codex": ("openai/codex", "@openai/codex", "rust-v"),
     "opencode": ("anomalyco/opencode", "@opencode/cli", "v"),
@@ -86,7 +88,8 @@ def writable(path):
 def decision(phase, value):
     if not isinstance(value, dict) or value.get("decision") not in DECISIONS[phase]:
         raise Stop("invalid_decision")
-    if value.get("coverage_complete") is not True:
+    coverage = value.get("coverage_complete")
+    if type(coverage) is not bool or (not coverage and value["decision"] != "needs_human"):
         raise Stop("incomplete_coverage")
     if not isinstance(value.get("summary"), str) or len(value["summary"]) > 6000:
         raise Stop("invalid_summary")
@@ -211,27 +214,93 @@ class Ledger:
                 "ref": "refs/heads/" + STATE_BRANCH, "sha": commit["sha"]})
         self.head = commit["sha"]
 
-    def claim(self, key, track, sha, repository=None):
+    def attempted(self, event, scan=None):
+        for item in self.value["attempts"].values():
+            if "scan" in item:
+                if scan and item["scan"] == scan["id"] and item["batch"] == scan["next_batch"]:
+                    return True
+                if (item["sha"] == event["after"] and item["repository"] == event["repository"]
+                        and item["track"] != event["track"]
+                        and item["status"] in {"published", "started", "uncertain", "blocked"}):
+                    return True
+            elif (item["sha"] == event["after"]
+                  and item.get("repository") in {None, event["repository"]}
+                  and item["status"] in {"published", "started", "uncertain", "blocked"}):
+                return True
+        return False
+
+    def claim(self, key, track, sha, repository=None, scan=None):
         if key in self.value["attempts"]:
             return False
         if len(self.value["attempts"]) >= 10000:
             raise Stop("state_capacity_reached")
+        if scan:
+            if self.attempted({"after": sha, "repository": repository, "track": track}, scan):
+                return False
+            scans = self.value.setdefault("scans", {})
+            if track in scans and scans[track] != scan:
+                raise Stop("scan_changed")
+            scans[track] = dict(scan)
         self.value["attempts"][key] = {"status": "started", "track": track, "sha": sha,
-                                       "repository": repository}
+                                        "repository": repository}
+        if scan:
+            self.value["attempts"][key].update(scan=scan["id"], batch=scan["next_batch"])
         self.save()
         return True
 
     def finish(self, key, status, pr=None):
+        previous = copy.deepcopy(self.value)
+        try:
+            self._finish(key, status, pr)
+            self.save()
+        except Exception:
+            # A failed progress write must not advance the in-memory scan before
+            # the controller records an uncertain outcome. Remote CAS still wins.
+            self.value = previous
+            raise
+
+    def _finish(self, key, status, pr):
         item = self.value["attempts"][key]
         item["status"] = status
         if pr:
             item["pr"] = pr
         if status in {"no_change", "rejected", "published"}:
-            self.value["cursors"][item["track"]] = item["sha"]
-        self.save()
+            if "scan" in item:
+                scan = self.value["scans"][item["track"]]
+                if scan["id"] != item["scan"] or scan["next_batch"] != item["batch"]:
+                    raise Stop("scan_changed")
+                scan["next_batch"] += 1
+                if scan["next_batch"] == scan["batch_count"]:
+                    self.value["cursors"][item["track"]] = item["sha"]
+                    del self.value["scans"][item["track"]]
+            else:
+                self.value["cursors"][item["track"]] = item["sha"]
 
 
-def collect(gh, manifest, cursors):
+def review_batch(event, scan=None):
+    """Freeze a complete inventory, exposing only one bounded slice to the model."""
+    files = event["files"]
+    plan = {k: event[k] for k in ("track", "repository", "before", "after", "version")}
+    plan.update(inventory=digest(files), file_count=len(files), batch_size=MAX_BATCH_FILES,
+                batch_count=max(1, (len(files) + MAX_BATCH_FILES - 1) // MAX_BATCH_FILES))
+    plan["id"] = digest(plan)
+    index = 0 if scan is None else scan.get("next_batch")
+    if (type(index) is not int or not 0 <= index < plan["batch_count"]
+            or (scan is not None and scan != {**plan, "next_batch": index})):
+        raise Stop("scan_changed")
+    selected = []
+    for item in files[index * MAX_BATCH_FILES:(index + 1) * MAX_BATCH_FILES]:
+        # Blob hashes stay in the inventory digest, not in every inference input.
+        compact = {k: item[k] for k in ("filename", "status")}
+        for side in ("before", "after"):
+            compact[side] = ({k: item[side][k] for k in ("mode", "type")}
+                             if item[side] is not None else None)
+        selected.append(compact)
+    return {**plan, "next_batch": index}, {**event, "files": selected,
+        "batch": {"index": index + 1, "count": plan["batch_count"], "total_files": len(files)}}
+
+
+def collect(gh, manifest, cursors, scans=None):
     baseline = {p["id"]: p for p in manifest["projects"]}
     observations = []
     for track, (repo, package, prefix) in TRACKS.items():
@@ -250,6 +319,11 @@ def collect(gh, manifest, cursors):
         if track in baseline:
             fallback = baseline[track]["commit"]
         before = cursors.get(track, fallback)
+        scan = (scans or {}).get(track)
+        if scan:
+            if scan["track"] != track or scan["repository"] != repo or scan["before"] != before:
+                raise Stop("scan_changed")
+            before, sha, version = scan["before"], scan["after"], scan["version"]
         if before == sha:
             continue
         event = {"track": track, "repository": repo, "before": before,

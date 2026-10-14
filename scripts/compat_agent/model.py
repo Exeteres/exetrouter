@@ -25,7 +25,8 @@ FINDING = {"type": "object", "properties": {
 SCHEMA = {
     "type": "object", "properties": {
         "decision": {"type": "string"}, "summary": {"type": "string"},
-        "coverage_complete": {"type": "boolean"},
+        "coverage_complete": {"type": "boolean", "description":
+            "Complete relevant coverage of the supplied batch. May be false only for needs_human."},
         "findings": {"type": "array", "items": FINDING},
         "title": {"type": "string"}, "body": {"type": "string"}},
     "required": ["decision", "summary", "coverage_complete", "findings"]}
@@ -139,6 +140,9 @@ class Model:
             if name == "submit_preliminary" and phase == "verify" and not revealed:
                 independent = decision("verify", args)
                 sandbox.validate_citations(independent)
+                if independent["decision"] == "needs_human":
+                    print("compat_agent: verdict_verify_needs_human", flush=True)
+                    return independent
                 revealed = True
                 result = {"independent_verdict": independent, "triage": triage}
             else:
