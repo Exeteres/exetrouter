@@ -8,4 +8,6 @@ Ordinary tests use synthetic data and temporary private directories. Tests marke
 
 On GitHub, CI runs on pull requests and pushes to `main`, not on feature-branch pushes. This avoids running branch and pull-request CI for the same change. Formatting, compatibility-agent/sandbox, publication, package and Docker updater checks run once on Linux. Clippy, Rust tests and installer checks still run on native Linux x86_64/ARM64 and macOS ARM64/Intel runners. Each CI job has a 30-minute timeout.
 
+CI caches Rust dependencies separately by runner platform, compiler and dependency configuration. Only successful `main` verification jobs from push events save caches; pull requests only restore them. The project's own compiled binaries and installed Cargo tools are not saved. The first run, a new compiler or changed dependencies may still require a fresh build.
+
 Release tags must match the Cargo version. Release automation builds from the tagged source and publishes binaries with SHA-256 checksums, never from a developer's working directory.
