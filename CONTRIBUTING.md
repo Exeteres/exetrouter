@@ -6,6 +6,6 @@ Keep user-facing UI and documentation in English. Preserve HTTP/SSE/WS compatibi
 
 Ordinary tests use synthetic data and temporary private directories. Tests marked ignored may contact OpenAI or run native clients; follow [live testing](docs/live-testing.md) and obtain explicit authorization. Do not submit state databases, keys, `.env` files, customer messages, tokens, logs or compatibility downloads. Publication audit failures print only the file and rule, never the detected value.
 
-On GitHub, CI runs on pull requests and pushes to `main`, not on feature-branch pushes. This avoids running branch and pull-request CI for the same change. CI tests native Linux x86_64/ARM64 and macOS ARM64/Intel builds.
+On GitHub, CI runs on pull requests and pushes to `main`, not on feature-branch pushes. This avoids running branch and pull-request CI for the same change. Formatting, compatibility-agent/sandbox, publication, package and Docker updater checks run once on Linux. Clippy, Rust tests and installer checks still run on native Linux x86_64/ARM64 and macOS ARM64/Intel runners. Each CI job has a 30-minute timeout.
 
 Release tags must match the Cargo version. Release automation builds from the tagged source and publishes binaries with SHA-256 checksums, never from a developer's working directory.
