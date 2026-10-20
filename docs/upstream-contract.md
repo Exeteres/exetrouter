@@ -38,6 +38,8 @@ Owned continuations may transfer at a quota boundary or a configured soft thresh
 
 Observation order and credential generation reject old updates; parallel success does not erase cooldown. A quota-storage failure is logged separately from usage, and unavailable preflight storage rejects new operations. Durable pauses depend on a healthy database.
 
+A dedicated live usage refresh with explicit `rate_limit.allowed: true` and valid general-meter windows may clear an `upstream_reset` cooldown, including after a reset outside the router. It never clears `retry_after`, `local_backoff` or operational health pauses. Recovery and window storage are atomic and require the same active credential generation. Any quota rejection saved for that account after the refresh order was allocated conservatively defers recovery until another refresh, even if the rejection has no windows or leaves the deadline unchanged. Newer stored windows also prevent recovery. Ordinary inference successes still cannot clear cooldown. See [schema 10 to 11](cooldown-recovery-migration.md) for the durable per-account fence and deployment/rollback requirements.
+
 ## Operational failures
 
 Catalog, refresh and Responses have separate 5–300-second backoff, extended by valid `Retry-After`. Upstream 401 returns a redacted authentication error and schedules refresh for a separate next operation; repeated rejection of refreshed credentials requires reauthorization. Quota transfer never bypasses authentication, deactivation or operational backoff.

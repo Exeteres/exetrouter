@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Release stale subscription-reset cooldowns after a fresh live usage check explicitly allows requests. Fence concurrent rejections, retain other pause sources and report any retained cooldown honestly. Add the schema-10-to-11 per-account ordering fence and reviewed migration/rollback procedure; no automatic deployment or reset-credit consumption.
+
 ## 0.5.3
 
 - Order inference quota observations with the shared upstream operation clock, so live limits refreshes do not suppress later HTTP/WS updates. Preserve stale-observation and credential-generation fences without a schema change.

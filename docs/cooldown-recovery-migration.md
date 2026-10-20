@@ -1,0 +1,13 @@
+# Cooldown recovery: schema 10 to 11
+
+This is an explicit operator migration, not a routine one-click packaging update. Migration 011 adds `oauth_accounts.cooldown_order`, a numeric per-account fence initialized to zero. Each saved quota rejection advances the existing durable operation clock and records its new sequence atomically with the cooldown. A dedicated live usage GET can clear only an `upstream_reset` cooldown when upstream explicitly allows requests, valid general-meter windows are present, the same credential generation is active, and neither a rejection saved since the GET began nor newer stored windows supersede it. Rejections without windows or with unchanged deadlines are fenced too. Activity on other accounts does not block recovery.
+
+Credentials, keys, users, tokens, preferences, usage, activation claims and existing cooldown deadlines are preserved. Ordinary inference successes cannot release cooldowns. Retry-After, local backoff and operational health are unchanged. Recovery itself sends no inference and consumes no reset credits; a subsequent Limits/Overview refresh retains its separately documented weekly-activation behavior.
+
+## Before deployment
+
+Review the recovery behavior, validate new binaries, retain the previous binaries/image and native gateway, and create and verify a private schema-10 snapshot using the installed binary. Stop all router workers before switching; deploy matching server and native gateway binaries together while preserving configuration, volumes, credentials and SSH peer UID boundaries. Standalone also migrates its private database transactionally on initialization. The Docker updater must continue to refuse a schema mismatch. Verify health and read-only Doctor without inference; refresh live limits only with authorization for their existing activation behavior. Older binaries refuse schema 11. No production migration or deployment is performed by ordinary tests.
+
+## Rollback
+
+Stop all router workers and preserve a verified private current snapshot first. In a reviewed maintenance transaction, drop only `oauth_accounts.cooldown_order` and set `PRAGMA user_version=10`. Restore the prior binaries/image and matching native gateway. Keep the current database, keys, credentials, usage, preferences and cooldown state; do not overwrite newer refreshed credentials or accounting with an old snapshot. The discarded field is only an ordering fence, not usage or a credit record. On rollback, the older router again retains subscription cooldowns until expiry or its confirmed-reset flow. A later re-upgrade initializes the fence to zero and requires a new live usage check before recovery.

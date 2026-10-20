@@ -62,6 +62,7 @@ fn usage_observation(value: &Value, now: i64) -> crate::quota::Observation {
         &json!({"type":"codex.rate_limits", "rate_limits":limits}),
         now,
     )
+    .with_live_allowed(value["rate_limit"]["allowed"].as_bool() == Some(true))
 }
 fn eligible(quota: &crate::quota::Summary, now: i64) -> Result<(f64, i64)> {
     let windows: Vec<_> = quota
@@ -191,7 +192,9 @@ impl Upstream {
                 })
             })
             .collect();
-        quota.status = if quota.windows.is_empty() {
+        quota.status = if quota.cooldown_until.is_some() {
+            "cooldown"
+        } else if quota.windows.is_empty() {
             "unknown"
         } else {
             "current"
@@ -430,23 +433,29 @@ impl Upstream {
         }
         state.credits.remove(&preview.account);
         if code == "reset" {
-            // A confirmed reset may release a subscription cooldown, never a transport backoff.
-            if let Some(until) = current.account.info.cooldown_until {
+            // Verify recovery through the same fenced live observation as an
+            // ordinary limits refresh; never clear a concurrent rejection.
+            if current.quota.cooldown_until.is_some() {
                 let id = preview.account;
                 let generation = preview.generation;
-                let order = self
-                    .db
-                    .call(|conn| crate::health::next(conn))
-                    .await
-                    .unwrap_or(0);
+                let order = self.db.call(|conn| crate::health::next(conn)).await.ok();
                 let usage = self.limits_get(&current.account, "usage", 8).await.ok();
-                if let Some(usage) = usage.filter(|v| v["rate_limit"]["allowed"] == true) {
+                if let (Some(order), Some(usage)) = (order, usage) {
                     let observation = usage_observation(&usage, Utc::now().timestamp());
-                    self.db.call(move |conn| {
-                        crate::quota::save(conn,id,generation,order,observation,Utc::now().timestamp())?;
-                        conn.execute("UPDATE oauth_accounts SET cooldown_until=NULL,cooldown_source=NULL WHERE id=?1 AND generation=?2 AND cooldown_until=?3 AND cooldown_source='upstream_reset' AND NOT EXISTS(SELECT 1 FROM oauth_quota_windows WHERE account_id=?1 AND request_order>?4)", rusqlite::params![id,generation,until,order])?;
-                        Ok(())
-                    }).await.ok();
+                    self.db
+                        .call(move |conn| {
+                            crate::quota::save(
+                                conn,
+                                id,
+                                generation,
+                                order,
+                                observation,
+                                Utc::now().timestamp(),
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                        .ok();
                 }
             }
         }
@@ -584,6 +593,69 @@ mod tests {
         }).await.unwrap();
         f
     }
+    #[tokio::test]
+    async fn live_limits_recovers_persisted_reset_cooldown_without_inference_or_credits() {
+        let f = Fixture::new().await;
+        f.used(0.0);
+        f.upstream
+            .db
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE oauth_accounts SET cooldown_until=?1,cooldown_source='upstream_reset'",
+                    [Utc::now().timestamp() + 86400],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let restarted =
+            Upstream::new(f.upstream.db.clone(), [2; 32], f.upstream.config.clone()).unwrap();
+        let quota = restarted.live_limits(1).await.unwrap().quota;
+        assert_eq!(quota.status, "current");
+        assert_eq!(quota.cooldown_until, None);
+        assert_eq!(quota.cooldown_source, None);
+        assert!(quota.windows.iter().all(|w| w.remaining_percent == 100.0));
+        restarted
+            .db
+            .call(|conn| {
+                assert_eq!(
+                    crate::quota::blocked_until(conn, 1, Utc::now().timestamp())?,
+                    None
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(f.mock.bodies.lock().unwrap().is_empty());
+        assert!(f.mock.activations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_limits_requires_explicit_allowed_not_just_full_percentages() {
+        let f = Fixture::new().await;
+        f.used(0.0);
+        f.upstream
+            .db
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE oauth_accounts SET cooldown_until=?1,cooldown_source='upstream_reset'",
+                    [Utc::now().timestamp() + 86400],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for allowed in [json!(false), Value::Null, json!("true"), json!(1)] {
+            f.mock.usage.lock().unwrap()["rate_limit"]["allowed"] = allowed;
+            let quota = f.upstream.live_limits(1).await.unwrap().quota;
+            assert_eq!(quota.status, "cooldown");
+            assert!(quota.cooldown_until.is_some());
+            assert!(quota.windows.iter().all(|w| w.remaining_percent == 100.0));
+        }
+        assert!(f.mock.bodies.lock().unwrap().is_empty());
+        assert!(f.mock.activations.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn weekly_activation_is_pinned_minimal_and_durable_across_refreshes_and_restart() {
         let f = inactive_fixture().await;

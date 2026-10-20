@@ -38,6 +38,7 @@ pub(crate) struct Sample {
 pub(crate) struct Observation {
     windows: Vec<Sample>,
     cooldown: Option<(i64, &'static str)>,
+    live_allowed: bool,
 }
 
 fn timestamp(value: Option<i64>) -> Option<i64> {
@@ -74,6 +75,13 @@ pub(crate) fn retry_at(value: &str, now: i64) -> Option<i64> {
 }
 
 impl Observation {
+    // Only a dedicated live usage GET may authorize recovery, never an
+    // inference success, header or unsolicited rate-limit event.
+    pub(crate) fn with_live_allowed(mut self, allowed: bool) -> Self {
+        self.live_allowed = allowed;
+        self
+    }
+
     /// Forward only validated numeric general-meter metadata. Never proxy
     /// arbitrary header names/values or fabricate absent windows/credits.
     pub(crate) fn response_headers(&self) -> HeaderMap {
@@ -290,6 +298,12 @@ pub(crate) fn save(
     if !valid {
         return Ok(());
     }
+    if observation.live_allowed && observation.cooldown.is_none() {
+        // The order was allocated before the GET. Any subsequently saved
+        // rejection for this account invalidates this conservative fence.
+        // This also covers rejections without windows and identical deadlines.
+        tx.execute("UPDATE oauth_accounts SET cooldown_until=NULL,cooldown_source=NULL WHERE id=?1 AND cooldown_source='upstream_reset' AND cooldown_order<?2 AND NOT EXISTS(SELECT 1 FROM oauth_quota_windows WHERE account_id=?1 AND request_order>?2)",params![account,order])?;
+    }
     for window in observation.windows {
         tx.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(?1,?2,?3,?4,?5,?6,?7)
             ON CONFLICT(account_id,kind) DO UPDATE SET used_percent=excluded.used_percent,window_minutes=excluded.window_minutes,reset_at=excluded.reset_at,observed_at=excluded.observed_at,request_order=excluded.request_order
@@ -299,6 +313,13 @@ pub(crate) fn save(
     if let Some((until, source)) = observation.cooldown {
         // Concurrent successful requests never clear a rejection. Multiple
         // rejections may extend cooldown but cannot shorten it.
+        // Advance even for an unchanged deadline or an older in-flight request:
+        // a live usage GET already in progress must not erase this rejection.
+        let rejection_order = crate::health::next(&tx)?;
+        tx.execute(
+            "UPDATE oauth_accounts SET cooldown_order=?1 WHERE id=?2",
+            params![rejection_order, account],
+        )?;
         tx.execute("UPDATE oauth_accounts SET cooldown_until=?1,cooldown_source=?2 WHERE id=?3 AND (cooldown_until IS NULL OR cooldown_until<=?1)",params![until,source,account])?;
     }
     tx.commit()?;
@@ -537,6 +558,150 @@ mod tests {
         );
         conn.execute("INSERT INTO oauth_accounts(account_id,state,encrypted_credentials,expires_at,created_at) VALUES('other','active',X'00',9999,1000)",[]).unwrap();
         assert_eq!(summary(&conn, 2, 1000).unwrap().status, "unknown");
+    }
+
+    #[test]
+    fn live_recovery_fences_even_windowless_unchanged_and_older_request_rejections() {
+        for reset in [1500, 2000, 3000] {
+            let mut conn = database();
+            let rejection = |reset| json!({"type":"error","error":{"code":"usage_limit_reached","resets_at":reset}});
+            let old_request = crate::health::next(&conn).unwrap();
+            put(&mut conn, old_request, rejection(2000));
+            let refresh = crate::health::next(&conn).unwrap();
+            // An older in-flight request rejects after the usage GET starts.
+            put(&mut conn, old_request, rejection(reset));
+            assert!(summary(&conn, 1, 1000).unwrap().windows.is_empty());
+            save(
+                &mut conn,
+                1,
+                0,
+                refresh,
+                event(&rate(0.0, 4000), 1000).with_live_allowed(true),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(
+                blocked_until(&conn, 1, 1000).unwrap(),
+                Some(reset.max(2000))
+            );
+            // The next fresh check can recover, without losing the fence.
+            let refresh = crate::health::next(&conn).unwrap();
+            save(
+                &mut conn,
+                1,
+                0,
+                refresh,
+                event(&rate(0.0, 4000), 1000).with_live_allowed(true),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(blocked_until(&conn, 1, 1000).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn live_recovery_preserves_newer_windows_generation_state_and_other_pause_sources() {
+        for scenario in [
+            "newer_window",
+            "generation",
+            "disabled",
+            "reauth_required",
+            "retry_after",
+            "local_backoff",
+            "unknown_source",
+            "empty",
+        ] {
+            let mut conn = database();
+            conn.execute(
+                "UPDATE oauth_accounts SET cooldown_until=2000,cooldown_source='upstream_reset'",
+                [],
+            )
+            .unwrap();
+            let refresh = crate::health::next(&conn).unwrap();
+            match scenario {
+                "newer_window" => {
+                    let order = crate::health::next(&conn).unwrap();
+                    put(&mut conn, order, rate(100.0, 2000));
+                }
+                "generation" => {
+                    conn.execute("UPDATE oauth_accounts SET generation=1", [])
+                        .unwrap();
+                }
+                "disabled" | "reauth_required" => {
+                    conn.execute("UPDATE oauth_accounts SET state=?1", [scenario])
+                        .unwrap();
+                }
+                "retry_after" | "local_backoff" | "unknown_source" => {
+                    conn.execute("UPDATE oauth_accounts SET cooldown_source=?1", [scenario])
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let observation = if scenario == "empty" {
+                Observation::default()
+            } else {
+                event(&rate(0.0, 4000), 1000)
+            };
+            save(
+                &mut conn,
+                1,
+                0,
+                refresh,
+                observation.with_live_allowed(true),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(
+                blocked_until(&conn, 1, 1000).unwrap(),
+                Some(2000),
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_recovery_is_account_scoped_and_atomic_with_window_storage() {
+        let mut conn = database();
+        conn.execute(
+            "UPDATE oauth_accounts SET cooldown_until=2000,cooldown_source='upstream_reset'",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO oauth_accounts(account_id,state,encrypted_credentials,expires_at,created_at) VALUES('other','active',X'00',9999,1000)", []).unwrap();
+        let refresh = crate::health::next(&conn).unwrap();
+        let other = crate::health::next(&conn).unwrap();
+        crate::health::failure(
+            &conn,
+            (1, 0),
+            crate::health::Scope::Responses,
+            other,
+            "transport",
+            Some(2500),
+            1000,
+        )
+        .unwrap();
+        save(
+            &mut conn,
+            2,
+            0,
+            other,
+            headers(&HeaderMap::new(), 429, 1000),
+            1000,
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_window BEFORE INSERT ON oauth_quota_windows BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        let recovered = || event(&rate(0.0, 4000), 1000).with_live_allowed(true);
+        assert!(save(&mut conn, 1, 0, refresh, recovered(), 1000).is_err());
+        assert_eq!(blocked_until(&conn, 1, 1000).unwrap(), Some(2000));
+        conn.execute_batch("DROP TRIGGER reject_window").unwrap();
+        save(&mut conn, 1, 0, refresh, recovered(), 1000).unwrap();
+        assert_eq!(blocked_until(&conn, 1, 1000).unwrap(), None);
+        assert_eq!(blocked_until(&conn, 2, 1000).unwrap(), Some(1060));
+        assert_eq!(crate::health::paused(&conn, 1, 1000).unwrap(), Some(2500));
+        assert_eq!(
+            summary(&conn, 1, 1000).unwrap().windows[0].used_percent,
+            0.0
+        );
     }
 
     #[test]

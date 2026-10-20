@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/008_quota_activation.sql"),
     include_str!("migrations/009_account_routing.sql"),
     include_str!("migrations/010_private_metadata.sql"),
+    include_str!("migrations/011_cooldown_recovery.sql"),
 ];
 pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 const QUEUE_CAPACITY: usize = 32;
@@ -119,6 +120,31 @@ impl Database {
 mod tests {
     use super::*;
     use crate::{authenticate, create_token, create_user};
+
+    #[test]
+    fn cooldown_recovery_migration_preserves_state_and_allows_reviewed_rollback() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..10] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 10).unwrap();
+        conn.execute("INSERT INTO oauth_accounts(account_id,state,encrypted_credentials,expires_at,created_at,generation,cooldown_until,cooldown_source) VALUES('fixture','active',X'1234',9999,0,7,2000,'upstream_reset')", []).unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        let state = conn.query_row("SELECT hex(encrypted_credentials),generation,cooldown_until,cooldown_source,cooldown_order FROM oauth_accounts", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?))).unwrap();
+        assert_eq!(state, ("1234".into(), 7, 2000, "upstream_reset".into(), 0));
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            "ALTER TABLE oauth_accounts DROP COLUMN cooldown_order; PRAGMA user_version=10;",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        init(&conn).unwrap();
+        assert_eq!(
+            crate::quota::blocked_until(&conn, 1, 1000).unwrap(),
+            Some(2000)
+        );
+    }
 
     #[test]
     fn routing_migration_preserves_saved_numbers_credentials_and_preferences() {
