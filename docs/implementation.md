@@ -12,7 +12,7 @@ SQLite currently uses schema 9. Migrations are transactional; versions 7, 8 and 
 | HTTP handlers / control connections | 128 / 32 |
 | Active generations / client WebSockets, global | 64 / 64 |
 | Active generations / client WebSockets, per user | 8 / 8 by default; configurable 1–64 |
-| Inference HTTP JSON / incoming client WS message or frame | 16 MiB |
+| Inference HTTP JSON / incoming client WS message or frame | 128 MiB |
 | Upstream WS message/frame / individual SSE event | 1 MiB |
 | Control command / reply | 32 KiB / 1 MiB |
 | SSE queue / WS continuation IDs | 8 chunks / 1024 IDs per socket |

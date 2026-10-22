@@ -767,7 +767,7 @@ async fn model_request(
                 return error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request_too_large",
-                    "request body exceeds the 16 MiB limit",
+                    "request body exceeds the 128 MiB limit",
                 );
             }
             return error(

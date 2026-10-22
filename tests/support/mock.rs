@@ -84,7 +84,7 @@ pub fn router(state: Arc<Mock>) -> Router {
     Router::new()
         .route("/models", get(models))
         .route("/responses", get(websocket).post(responses))
-        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .route("/oauth/token", post(token))
         .route("/api/accounts/deviceauth/usercode", post(device))
         .route("/api/accounts/deviceauth/token", post(device_poll))
@@ -487,7 +487,10 @@ async fn websocket(
             HeaderValue::from_static("private-synthetic-ws-turn-state"),
         );
     }
-    let mut upgrade = ws.on_upgrade(move |mut socket| async move {
+    let mut upgrade = ws
+        .max_message_size(128 * 1024 * 1024)
+        .max_frame_size(128 * 1024 * 1024)
+        .on_upgrade(move |mut socket| async move {
         while let Some(Ok(message)) = socket.next().await {
             match message {
                 Message::Text(text) => {

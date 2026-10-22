@@ -306,7 +306,8 @@ async fn compressed_native_bodies_are_decoded_once_and_invalid_frames_never_subm
     let client = reqwest::Client::new();
     let mut body = request();
     body["stream"] = json!(false);
-    body["input"][0]["content"] = json!("synthetic-compressed-marker ".repeat(90000));
+    body["input"][0]["content"] = json!("synthetic-compressed-marker ".repeat(700_000));
+    assert!(serde_json::to_vec(&body).unwrap().len() > 16 * 1024 * 1024);
     let frame = zstd::stream::encode_all(&serde_json::to_vec(&body).unwrap()[..], 3).unwrap();
     let submit = |bytes: Vec<u8>, coding: &str, authorized: bool| {
         client
@@ -328,12 +329,12 @@ async fn compressed_native_bodies_are_decoded_once_and_invalid_frames_never_subm
         fixture.mock.requests.lock().unwrap()[0]["input"],
         body["input"]
     );
-    let bomb = zstd::stream::encode_all(&vec![b' '; 16 * 1024 * 1024 + 1][..], 3).unwrap();
+    let bomb = zstd::stream::encode_all(&vec![b' '; 128 * 1024 * 1024 + 1][..], 3).unwrap();
     for (bytes, coding, status) in [
         (frame[..frame.len() - 1].to_vec(), "zstd", 400),
         (b"private-invalid-compression".to_vec(), "zstd", 400),
         (bomb, "zstd", 413),
-        (vec![0; 16 * 1024 * 1024 + 1], "zstd", 413),
+        (vec![0; 128 * 1024 * 1024 + 1], "zstd", 413),
         (frame.clone(), "gzip", 415),
         (frame.clone(), "zstd, identity", 415),
     ] {
@@ -687,10 +688,10 @@ async fn codex_completes_ws_tool_cycles_with_idle_ping_and_idle_reconnection() {
 #[tokio::test]
 async fn large_histories_reach_upstream_over_http_compact_chat_and_websocket() {
     let fixture = Fixture::start(false).await;
-    let history = "synthetic-long-history ".repeat(150_000);
+    let history = "synthetic-long-history ".repeat(850_000);
     let mut body = request();
     body["input"][0]["content"] = json!(history);
-    assert!(body.to_string().len() > 2 * 1024 * 1024);
+    assert!(body.to_string().len() > 16 * 1024 * 1024);
 
     let response = fixture.post(body.clone()).await;
     assert_eq!(response.status(), 200);
@@ -748,7 +749,7 @@ async fn oversized_websocket_history_closes_before_submission() {
     let mut socket = fixture.ws().await;
     let mut body = request();
     body["type"] = json!("response.create");
-    body["input"][0]["content"] = json!("x".repeat(16 * 1024 * 1024));
+    body["input"][0]["content"] = json!("x".repeat(128 * 1024 * 1024));
     // A rejected frame may close the socket while the client is still writing it.
     let _ = socket.send(Message::Text(body.to_string().into())).await;
     loop {
@@ -769,7 +770,7 @@ async fn oversized_websocket_history_closes_before_submission() {
 #[tokio::test]
 async fn oversized_and_malformed_http_requests_never_submit_or_record_usage() {
     let fixture = Fixture::start(false).await;
-    let large = json!({"model":"gpt-test","input":"x".repeat(16 * 1024 * 1024)}).to_string();
+    let large = json!({"model":"gpt-test","input":"x".repeat(128 * 1024 * 1024)}).to_string();
     for path in ["responses", "responses/compact", "chat/completions"] {
         let response = reqwest::Client::new()
             .post(format!("{}/v1/{path}", fixture.url))
