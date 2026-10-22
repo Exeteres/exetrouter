@@ -2,7 +2,12 @@
 
 ## Unreleased
 
+## 0.5.4
+
+- Raise inference HTTP bodies, compressed and decoded zstd bodies, and incoming client WebSocket messages/frames from 16 MiB to 128 MiB. Match the bundled nginx templates and add large-request regression coverage. Keep output buffering and retained recovery history limits unchanged.
 - Release stale subscription-reset cooldowns after a fresh live usage check explicitly allows requests. Fence concurrent rejections, retain other pause sources and report any retained cooldown honestly. Add the schema-10-to-11 per-account ordering fence and reviewed migration/rollback procedure; no automatic deployment or reset-credit consumption.
+- Require the reviewed [schema 10 to 11 migration](docs/cooldown-recovery-migration.md) for existing servers; the Docker updater intentionally refuses a schema mismatch. Publishing this release does not migrate deployed servers.
+- Bound and resume upstream compatibility evidence reads, avoid duplicate CI runs, and cache trusted main-build Rust dependencies.
 
 ## 0.5.3
 
