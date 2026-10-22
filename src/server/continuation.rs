@@ -4,7 +4,8 @@ use std::{io, sync::Arc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(super) const TOTAL_BYTES: usize = 64 * 1024 * 1024;
-const WINDOW_BYTES: usize = crate::payload::INFERENCE_REQUEST_BYTES;
+// Retained recovery history has its own bound, independent of transient input.
+const WINDOW_BYTES: usize = 16 * 1024 * 1024;
 const ITEMS: usize = 16384;
 
 pub(super) struct Window {

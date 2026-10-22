@@ -123,7 +123,7 @@ pub(super) async fn prepare(state: &Arc<AppState>, request: Request) -> Result<R
                 } else {
                     "invalid_request_error"
                 },
-                "compressed request body could not be read within the 16 MiB limit",
+                "compressed request body could not be read within the 128 MiB limit",
             ));
         }
         Err(_) => {
@@ -156,7 +156,7 @@ pub(super) async fn prepare(state: &Arc<AppState>, request: Request) -> Result<R
                 Failure::Large => (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request_too_large",
-                    "decoded request body exceeds the 16 MiB limit",
+                    "decoded request body exceeds the 128 MiB limit",
                 ),
                 Failure::Timeout => (
                     StatusCode::REQUEST_TIMEOUT,
