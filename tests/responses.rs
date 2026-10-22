@@ -731,7 +731,11 @@ async fn large_histories_reach_upstream_over_http_compact_chat_and_websocket() {
         .send(Message::Text(body.to_string().into()))
         .await
         .unwrap();
-    assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+    // Debug builds on slower runners need time to parse and forward >16 MiB.
+    assert_eq!(
+        terminal_with_timeout(&mut socket, Duration::from_secs(30)).await["type"],
+        "response.completed"
+    );
     assert_eq!(
         fixture.mock.requests.lock().unwrap().last().unwrap()["input"][0]["content"],
         history
@@ -2919,8 +2923,18 @@ async fn terminal(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Value {
+    terminal_with_timeout(socket, Duration::from_secs(3)).await
+}
+
+async fn terminal_with_timeout(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    timeout: Duration,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let message = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        let message = tokio::time::timeout_at(deadline, socket.next())
             .await
             .unwrap()
             .unwrap()
