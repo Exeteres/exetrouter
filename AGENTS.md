@@ -45,6 +45,13 @@ Human-readable output is the default; `--json` is the explicit automation interf
 
 Update checks and ordinary metadata refresh must not submit inference or consume reset credits. The weekly-activation exception permits one minimal `gpt-5.6-sol` request on a freshly verified 100%-remaining weekly window with reset exactly seven days ahead at minute precision. Persist the attempt before submission, suppress repeats for seven days. Respect `EXR_NO_UPDATE_CHECK`; label stale/unknown observations honestly and preserve reported durations.
 
+## Git workflow
+
+- Make all changes and local commits directly on `main` in the existing checkout. Do not create separate branches or worktrees unless the user explicitly asks for an exception.
+- Push only when the user explicitly requests it. A request to edit, commit, merge or deploy does not authorize a push or remote branch deletion.
+- Preserve unrelated uncommitted changes and never include them in a commit without authorization. A dirty checkout is not a reason to create another branch or worktree; stop and ask if safe work on `main` is blocked.
+- When branch cleanup is requested, delete only branches whose changes are already in `main`. Check ancestry and, when needed, patch equivalence; preserve any unique changes. Remove an associated worktree only after confirming it has no uncommitted, untracked or ignored files that need to be kept. Remote branch deletion requires explicit authorization.
+
 ## Development and validation
 
 Use Rust 1.88 or newer and a C compiler. SQLite is bundled. Prefer small changes in the existing modules and meaningful tests for changed contracts; documentation-only or cosmetic changes do not require new mirrored tests.
