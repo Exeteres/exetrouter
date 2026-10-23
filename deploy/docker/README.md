@@ -132,6 +132,23 @@ Only `/v1/` goes through your reviewed TLS ingress. Preserve existing administra
 
 Docker's `restart: unless-stopped` restarts the application. For unattended boot with ephemeral runtime keys, install the `exetrouter-compose.service` as `exetrouter.service`, then run `systemctl daemon-reload` and `systemctl enable exetrouter.service`. Its start command is Compose `up -d --wait`; its stop command gracefully stops the stack. Do not enable a competing native API service.
 
+Docker can still be recovering when the first Compose health check runs. The unit retries failed startup after ten seconds, with at most three starts in five minutes. After Compose reports healthy, `ExecStartPost` queues the SSH gateway without waiting for it. This avoids an ordering deadlock and starts SSH even if its original boot job failed. The gateway still requires successful API startup. Persistent failures remain visible as failed units rather than retrying forever.
+
+For an existing unit with custom Compose arguments, preserve it and add this drop-in with `sudo systemctl edit exetrouter.service`:
+
+```ini
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Restart=on-failure
+RestartSec=10
+ExecStartPost=/usr/bin/systemctl --no-block start exetrouter-sshd.service
+```
+
+Reload with `sudo systemctl daemon-reload`; no API restart is needed to load these settings. If startup has already failed, run `sudo systemctl reset-failed exetrouter.service` and `sudo systemctl start exetrouter.service` to recover. On a Linux systemd host, `sudo python3 scripts/test-docker-boot.py` tests transient recovery and persistent failure with isolated temporary units, without Docker, real keys, network listeners or inference.
+
 For existing installations using `compose.host-network.yaml`, preserve it and include **both** files in every command:
 
 ```sh
