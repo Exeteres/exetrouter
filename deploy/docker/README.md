@@ -132,6 +132,15 @@ Only `/v1/` goes through your reviewed TLS ingress. Preserve existing administra
 
 Docker's `restart: unless-stopped` restarts the application. For unattended boot with ephemeral runtime keys, install the `exetrouter-compose.service` as `exetrouter.service`, then run `systemctl daemon-reload` and `systemctl enable exetrouter.service`. Its start command is Compose `up -d --wait`; its stop command gracefully stops the stack. Do not enable a competing native API service.
 
+Install the runtime directory rule before enabling the unit:
+
+```sh
+sudo install -m 644 deploy/docker/exetrouter-tmpfiles.conf /etc/tmpfiles.d/exetrouter.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/exetrouter.conf
+```
+
+This recreates `/run/exetrouter` at boot before the unit's filesystem sandbox is set up. The credentials container sets application ownership and recreates private runtime keys. Use tmpfiles rather than `RuntimeDirectory` for this Docker wrapper: systemd would otherwise reset directory ownership before subsequent unit commands. Remove the old directory-creating `ExecStartPre` from existing units.
+
 Docker can still be recovering when the first Compose health check runs. The unit retries failed startup after ten seconds, with at most three starts in five minutes. After Compose reports healthy, `ExecStartPost` queues the SSH gateway without waiting for it. This avoids an ordering deadlock and starts SSH even if its original boot job failed. The gateway still requires successful API startup. Persistent failures remain visible as failed units rather than retrying forever.
 
 For an existing unit with custom Compose arguments, preserve it and add this drop-in with `sudo systemctl edit exetrouter.service`:
