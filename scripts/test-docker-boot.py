@@ -2,6 +2,7 @@
 """Test Docker boot recovery with isolated systemd units; requires Linux and root."""
 import configparser
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,11 +40,14 @@ class BootRecovery(unittest.TestCase):
             work = Path(temporary)
             name = work.name
             units = [f'{name}.service', f'{name}-sshd.service']
+            runtime = Path('/run') / f'{name}-runtime'
+            self.assertFalse(runtime.exists())
             paths = [Path('/run/systemd/system') / unit for unit in units]
             created = []
             attempt = work / 'attempt.py'
             attempt.write_text(
                 'import sys, time\nfrom pathlib import Path\n'
+                f'assert Path({str(runtime)!r}).is_dir()\n'
                 'p = Path(__file__).with_name("attempts")\n'
                 'n = int(p.read_text()) + 1 if p.exists() else 1\n'
                 'p.write_text(str(n))\n'
@@ -59,6 +63,11 @@ class BootRecovery(unittest.TestCase):
                 'Path(__file__).with_name("gateway-started").touch()\n'
             )
             # Keep the real retry/dependency rules, but replace all application work.
+            rule = work / 'runtime.conf'
+            rule.write_text((ROOT / 'deploy/docker/exetrouter-tmpfiles.conf').read_text()
+                            .replace('/run/exetrouter', str(runtime))
+                            .replace('exetrouter exetrouter-gateway', 'root root'))
+            subprocess.run(['systemd-tmpfiles', '--create', str(rule)], check=True)
             main = main.replace('exetrouter-sshd.service', units[1])
             main = replace_directives(main, {
                 'Requires': '', 'After': '',
@@ -67,7 +76,8 @@ class BootRecovery(unittest.TestCase):
                                       'exetrouter-sshd.service', units[1]),
                 'WorkingDirectory': str(work), 'ExecStartPre': '/usr/bin/true',
                 'ExecStart': f'/usr/bin/python3 {attempt} {failures}',
-                'ExecStop': '/usr/bin/true', 'ReadWritePaths': str(work),
+                'ExecStop': '/usr/bin/true',
+                'ReadWritePaths': f'{work} {runtime}',
             })
             gateway = gateway.replace('exetrouter.service', units[0])
             gateway = replace_directives(gateway, {
@@ -122,6 +132,7 @@ class BootRecovery(unittest.TestCase):
                 systemctl('reset-failed', *units, check=False)
                 for path in created:
                     path.unlink(missing_ok=True)
+                shutil.rmtree(runtime, ignore_errors=True)
                 systemctl('daemon-reload')
 
     def test_transient_failure_recovers_api_and_gateway(self):
