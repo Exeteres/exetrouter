@@ -3400,6 +3400,116 @@ async fn pinned_ws_rejects_context_from_another_account_without_moving_its_histo
 }
 
 #[tokio::test]
+async fn transferred_ws_discards_retired_turn_state_before_checking_full_context() {
+    for used in [80., 100.] {
+        let fixture = Fixture::start(false).await;
+        fixture.add_account(&["gpt-test"], false).await;
+        *fixture.mock.mode.lock().unwrap() = "turn_state".into();
+        let mut socket = fixture.ws().await;
+        let mut body = request();
+        body["type"] = json!("response.create");
+        body["test_mode"] = json!("native_proofs");
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let created: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(created["type"], "response.created");
+        let metadata: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(metadata["type"], "response.metadata");
+        let turn_state = metadata["headers"]["x-codex-turn-state"].clone();
+        let first = terminal(&mut socket).await;
+        assert_eq!(first["type"], "response.completed");
+        let unrelated_checkpoint = fixture
+            .compact(json!({"model":"gpt-test","input":first["response"]["output"]}))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap()["output"][0]
+            .clone();
+        body["input"].as_array_mut().unwrap().extend(
+            first["response"]["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        body["input"].as_array_mut().unwrap().push(
+            json!({"role":"user","content":"synthetic complete context before quota transfer"}),
+        );
+        // Codex retains its first routing token throughout a turn, including after
+        // the router has moved that turn to a replacement account.
+        body["client_metadata"] = json!({"x-codex-turn-state":turn_state});
+        configure_soft_threshold(&fixture, 1, used, 0).await;
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let second = terminal(&mut socket).await;
+        assert_eq!(second["type"], "response.completed", "{second}");
+        body["input"].as_array_mut().unwrap().extend(
+            second["response"]["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"synthetic full-context continuation"}));
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let third = terminal(&mut socket).await;
+        assert_eq!(third["type"], "response.completed", "{third}");
+        let requests = fixture.mock.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["input"], upstream_value(&body["input"]));
+        assert!(requests[2]
+            .pointer("/client_metadata/x-codex-turn-state")
+            .is_none());
+        assert_eq!(
+            fixture.mock.request_accounts.lock().unwrap().as_slice(),
+            [
+                "upstream-account",
+                "upstream-account-2",
+                "upstream-account-2"
+            ]
+        );
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(unrelated_checkpoint);
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal(&mut socket).await["error"]["code"],
+            "context_account_mismatch"
+        );
+        assert_eq!(fixture.mock.requests.lock().unwrap().len(), 3);
+        body["input"].as_array_mut().unwrap().pop();
+        body["client_metadata"]["x-codex-turn-state"] = json!("unverified-retired-turn-state");
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal(&mut socket).await["error"]["code"],
+            "context_not_found"
+        );
+        assert_eq!(fixture.mock.requests.lock().unwrap().len(), 3);
+        socket.close(None).await.unwrap();
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn context_affinity_survives_refresh_and_never_bypasses_cooldown_or_missing_models() {
     let fixture = Fixture::start(false).await;
     fixture

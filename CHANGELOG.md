@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Preserve explicitly requested Responses Lite mode without requiring a visible tool prefix, including compaction, continuations and replacement WebSocket handshakes. Keep opaque-context ownership checks and arbitrary-header filtering unchanged.
+- Authenticate and discard retired WebSocket turn state before checking full-context ownership after an authorized account transfer, avoiding false mixed-account errors when native clients replay their original turn token.
 
 ## 0.5.4
 

@@ -2140,21 +2140,6 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
         }
         let mut rejected_accounts = Vec::new();
         'attempt: loop {
-            let (mut context, portable) = match context_account(&state, &identity, &payload).await {
-                Ok(context) => context,
-                Err(err) => {
-                    if send_client(&mut client, ws_error(err.code(), err.message()))
-                        .await
-                        .is_err()
-                    {
-                        break 'frames;
-                    }
-                    if matches!(err, ContextError::Storage) {
-                        break 'frames;
-                    }
-                    continue 'frames;
-                }
-            };
             let mut frame_turn = match payload.pointer("/client_metadata/x-codex-turn-state") {
                 None | Some(Value::Null) => identity.turn_state.clone(),
                 Some(Value::String(value)) => match HeaderValue::from_str(value) {
@@ -2194,6 +2179,24 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     metadata.remove("x-codex-turn-state");
                 }
             }
+            // Codex replays its first turn token even after an authorized transfer.
+            // Authenticate and discard retired state before comparing it with the
+            // replacement account's opaque output in a full-context request.
+            let (mut context, portable) = match context_account(&state, &identity, &payload).await {
+                Ok(context) => context,
+                Err(err) => {
+                    if send_client(&mut client, ws_error(err.code(), err.message()))
+                        .await
+                        .is_err()
+                    {
+                        break 'frames;
+                    }
+                    if matches!(err, ContextError::Storage) {
+                        break 'frames;
+                    }
+                    continue 'frames;
+                }
+            };
             if portable {
                 if let Some(bound) = &binding {
                     context = Some(bound.account.info.id);
