@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve explicitly requested Responses Lite mode without requiring a visible tool prefix, including compaction, continuations and replacement WebSocket handshakes. Keep opaque-context ownership checks and arbitrary-header filtering unchanged.
+
 ## 0.5.4
 
 - Raise inference HTTP bodies, compressed and decoded zstd bodies, and incoming client WebSocket messages/frames from 16 MiB to 128 MiB. Match the bundled nginx templates and add large-request regression coverage. Keep output buffering and retained recovery history limits unchanged.

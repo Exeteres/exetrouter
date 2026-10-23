@@ -2350,7 +2350,7 @@ async fn responses_lite_tools_keep_their_input_and_enable_the_required_http_and_
     let unsupported = reqwest::Client::new()
         .post(format!("{}/v1/responses", fixture.url))
         .bearer_auth(&fixture.secret)
-        .header("x-openai-internal-codex-responses-lite", "true")
+        .header("x-openai-internal-codex-responses-lite", "false")
         .json(&body)
         .send()
         .await
@@ -2384,6 +2384,151 @@ async fn responses_lite_tools_keep_their_input_and_enable_the_required_http_and_
         .await
         .iter()
         .all(|row| row["status"] == "completed"));
+    socket.close(None).await.unwrap();
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn responses_lite_header_survives_compaction_and_continuation_without_a_tool_prefix() {
+    for path in ["responses", "responses/compact"] {
+        let fixture = Fixture::start(false).await;
+        let client = reqwest::Client::new();
+        let post = |path: &str, body: &Value| {
+            client
+                .post(format!("{}/v1/{path}", fixture.url))
+                .bearer_auth(&fixture.secret)
+                .header("x-openai-internal-codex-responses-lite", "true")
+                .json(body)
+                .send()
+        };
+        let prefix = json!({"type":"additional_tools","role":"developer","tools":[]});
+        let user = json!({"role":"user","content":"synthetic conversation before compaction"});
+        let mut body = json!({"model":"gpt-test","stream":false,"input":[prefix,user],"test_mode":"native_proofs"});
+        let reply = post("responses", &body).await.unwrap();
+        assert_eq!(reply.status(), 200);
+        let output = reply.json::<Value>().await.unwrap()["output"].clone();
+        let mut history = vec![user];
+        history.extend(output.as_array().unwrap().iter().cloned());
+        // Current Codex can send Lite compaction and follow-up requests without
+        // a visible tool inventory. The explicit mode is independent of input.
+        if path == "responses" {
+            history.push(json!({"type":"compaction_trigger"}));
+        }
+        body["input"] = json!(history);
+        let reply = post(path, &body).await.unwrap();
+        assert_eq!(
+            reply.status(),
+            200,
+            "{path}: {}",
+            reply.text().await.unwrap()
+        );
+        let checkpoint = reply.json::<Value>().await.unwrap()["output"][0].clone();
+        assert_eq!(checkpoint["type"], "compaction");
+        assert!(checkpoint["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .starts_with("exrctx1."));
+        body["input"] =
+            json!([checkpoint,{"role":"user","content":"synthetic continuation after compaction"}]);
+        let reply = post("responses", &body).await.unwrap();
+        assert_eq!(reply.status(), 200);
+        assert_eq!(reply.json::<Value>().await.unwrap()["status"], "completed");
+        assert_eq!(fixture.mock.lite_requests.load(Ordering::SeqCst), 3);
+        let compactions = fixture.mock.compactions.lock().unwrap().clone();
+        assert_eq!(compactions.len(), 1);
+        assert!(compactions[0].1["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "additional_tools"));
+        assert_eq!(
+            fixture.mock.requests.lock().unwrap().last().unwrap()["input"][0],
+            upstream_value(&checkpoint)
+        );
+        assert!(fixture
+            .rows()
+            .await
+            .iter()
+            .all(|row| row["status"] == "completed"));
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn responses_lite_upgrade_mode_survives_prefix_free_reconnect_and_quota_transfer() {
+    let fixture = Fixture::start(false).await;
+    let checkpoint = fixture
+        .compact(json!({"model":"gpt-test","input":[]}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap()["output"][0]
+        .clone();
+    fixture.add_account(&["gpt-test"], false).await;
+    fixture.upstream.models().await.unwrap();
+    let mut request = format!("{}/v1/responses", fixture.url.replace("http://", "ws://"))
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", fixture.secret).parse().unwrap(),
+    );
+    request.headers_mut().insert(
+        "x-openai-internal-codex-responses-lite",
+        "true".parse().unwrap(),
+    );
+    let mut socket = connect_async(request).await.unwrap().0;
+    let mut body = json!({"type":"response.create","model":"gpt-test","input":[checkpoint,{"role":"user","content":"synthetic continuation"}],"test_mode":"idle_close"});
+    socket
+        .send(Message::Text(body.to_string().into()))
+        .await
+        .unwrap();
+    let first = terminal(&mut socket).await;
+    assert_eq!(first["type"], "response.completed", "{first}");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.mock.idle_closes.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    body.as_object_mut().unwrap().remove("test_mode");
+    body["previous_response_id"] = first["response"]["id"].clone();
+    body["input"] = json!([{"role":"user","content":"synthetic reconnect"}]);
+    socket
+        .send(Message::Text(body.to_string().into()))
+        .await
+        .unwrap();
+    let second = terminal(&mut socket).await;
+    assert_eq!(second["type"], "response.completed", "{second}");
+    fixture.db.call(|conn| {
+        let now=chrono::Utc::now().timestamp();
+        conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(1,'primary',100,300,?1,?2,0)",rusqlite::params![now+300,now])?;
+        Ok(())
+    }).await.unwrap();
+    body["previous_response_id"] = second["response"]["id"].clone();
+    body["input"] = json!([{"role":"user","content":"synthetic quota transfer"}]);
+    socket
+        .send(Message::Text(body.to_string().into()))
+        .await
+        .unwrap();
+    let third = terminal(&mut socket).await;
+    assert_eq!(third["type"], "response.completed", "{third}");
+    assert_eq!(fixture.mock.lite_handshakes.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fixture.mock.request_accounts.lock().unwrap().as_slice(),
+        ["upstream-account", "upstream-account", "upstream-account-2"]
+    );
+    let requests = fixture.mock.requests.lock().unwrap().clone();
+    assert!(requests[1].get("previous_response_id").is_none());
+    assert!(requests[2].get("previous_response_id").is_none());
+    assert_eq!(requests[2]["input"][0], upstream_value(&checkpoint));
+    assert!(requests.iter().all(|request| request["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["type"] != "additional_tools")));
     socket.close(None).await.unwrap();
     fixture.stop().await;
 }

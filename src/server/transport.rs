@@ -705,22 +705,12 @@ fn prepare(payload: &mut Value, compact: bool) -> Result<bool> {
     Ok(streaming)
 }
 
-fn lite_mode(identity: &Identity, payload: &Value) -> Result<()> {
-    if let Some(mode) = &identity.lite_mode {
-        let witnessed = payload["input"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["type"] == "additional_tools"))
-            || payload
-                .pointer(
-                    "/client_metadata/ws_request_header_x_openai_internal_codex_responses_lite",
-                )
-                .and_then(Value::as_str)
-                == Some("true");
-        if mode != "true" || !witnessed {
-            return Err("Responses Lite requires the native additional_tools prefix or recognized Lite frame metadata".into());
-        }
+fn lite_mode(identity: &Identity) -> Result<bool> {
+    match &identity.lite_mode {
+        None => Ok(false),
+        Some(mode) if mode == "true" => Ok(true),
+        Some(_) => Err("Responses Lite header must be true when present".into()),
     }
-    Ok(())
 }
 
 fn record(
@@ -987,13 +977,16 @@ pub(super) async fn http(
     headers: HeaderMap,
 ) -> Response {
     let chat_request = surface == "chat_completions";
-    if let Err(err) = lite_mode(&identity, &payload) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            &err.to_string(),
-        );
-    }
+    let responses_lite = match lite_mode(&identity) {
+        Ok(mode) => mode,
+        Err(err) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &err.to_string(),
+            )
+        }
+    };
     let compact = surface == "responses_compact";
     let mut chat_stream = None;
     let prepared = if chat_request {
@@ -1150,7 +1143,7 @@ pub(super) async fn http(
                 let _=log.finish("interrupted", Counters::default()).await;
                 return error(StatusCode::SERVICE_UNAVAILABLE, "service_stopping", "service stopping");
             },
-            socket=upstream.websocket(&account,(&session,&thread),true,&dispatch_payload)=>match socket {
+            socket=upstream.websocket(&account,(&session,&thread),true,&dispatch_payload,responses_lite)=>match socket {
                 Ok((socket, _headers))=>Some(socket),
                 Err(crate::upstream::SocketError::Cooldown(until))=> {
                     let _=log.finish("local_rejected", Counters::default()).await;
@@ -1237,7 +1230,7 @@ pub(super) async fn http(
                 .and_then(|v| HeaderValue::from_str(&v).ok());
             let response = tokio::select! {
                 _=wait_for_stop(stopped.clone())=>Err("service stopping".into()),
-                response=upstream.post(&account,path,&dispatch_payload,Some((&session,&thread)),log.health_order,dispatch_turn.as_ref())=>response,
+                response=upstream.post(&account,path,&dispatch_payload,Some((&session,&thread)),log.health_order,crate::upstream::InferenceHeaders { turn_state:dispatch_turn.as_ref(), responses_lite })=>response,
             };
             let response = match response {
                 Ok(response) => response,
@@ -2046,14 +2039,17 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
             .await;
             continue;
         }
-        if let Err(err) = lite_mode(&identity, &payload) {
-            let _ = send_client(
-                &mut client,
-                ws_error("invalid_request_error", &err.to_string()),
-            )
-            .await;
-            continue;
-        }
+        let responses_lite = match lite_mode(&identity) {
+            Ok(mode) => mode,
+            Err(err) => {
+                let _ = send_client(
+                    &mut client,
+                    ws_error("invalid_request_error", &err.to_string()),
+                )
+                .await;
+                continue;
+            }
+        };
         if let Some(previous) = payload.get("previous_response_id").filter(|v| !v.is_null()) {
             if !previous.as_str().is_some_and(|id| responses.contains(id)) {
                 let _ = send_client(
@@ -2305,6 +2301,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                                 0,
                                             )
                                             .expect("validated context"),
+                                            responses_lite,
                                         )
                                         .await
                                 } else {
@@ -2322,6 +2319,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                                 0,
                                             )
                                             .expect("validated context"),
+                                            responses_lite,
                                         )
                                         .await
                                         .map(|(socket, metadata)| (account, socket, metadata))
@@ -2489,6 +2487,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                         (&cache.identity_session, &cache.thread),
                         &mut affinity::upstream_payload(&payload, &state.key, identity.user_id, 0)
                             .expect("validated context"),
+                        responses_lite,
                     )
                     .await
                 {
@@ -2678,6 +2677,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                         false,
                         &affinity::upstream_payload(&payload, &state.key, identity.user_id, 0)
                             .expect("validated context"),
+                        responses_lite,
                     )
                     .await
                 {
@@ -2982,6 +2982,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                         0,
                                     )
                                     .expect("validated context"),
+                                    responses_lite,
                                 )
                                 .await
                             {

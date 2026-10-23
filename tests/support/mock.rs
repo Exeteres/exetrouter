@@ -32,6 +32,7 @@ pub struct Mock {
     pub catalog_started: Notify,
     pub accounts: Mutex<HashMap<String, Account>>,
     pub refreshes: AtomicUsize,
+    pub lite_requests: AtomicUsize,
     pub lite_handshakes: AtomicUsize,
     pub invalid_grant: AtomicBool,
     pub refresh_wait: AtomicBool,
@@ -248,6 +249,12 @@ async fn responses(
     Json(body): Json<Value>,
 ) -> Response {
     assert_eq!(headers["accept"], "text/event-stream");
+    if headers
+        .get("x-openai-internal-codex-responses-lite")
+        .is_some_and(|value| value == "true")
+    {
+        state.lite_requests.fetch_add(1, Ordering::SeqCst);
+    }
     if body["input"]
         .as_array()
         .unwrap()

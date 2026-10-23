@@ -25,6 +25,12 @@ pub const CODEX_CLIENT_VERSION: &str = "0.159.3";
 pub const BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 pub type UpstreamSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[derive(Default)]
+pub struct InferenceHeaders<'a> {
+    pub turn_state: Option<&'a HeaderValue>,
+    pub responses_lite: bool,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub base_url: String,
@@ -665,10 +671,10 @@ impl Upstream {
         body: &Value,
         session: Option<(&str, &str)>,
         order: i64,
-        turn_state: Option<&HeaderValue>,
+        options: InferenceHeaders<'_>,
     ) -> Result<reqwest::Response> {
-        let mut headers = inference_headers(account, body)?;
-        if let Some(value) = turn_state {
+        let mut headers = inference_headers(account, body, options.responses_lite)?;
+        if let Some(value) = options.turn_state {
             headers.insert("x-codex-turn-state", value.clone());
         }
         headers.insert(
@@ -735,10 +741,14 @@ impl Upstream {
         model: &str,
         identity: (&str, &str),
         payload: &mut Value,
+        responses_lite: bool,
     ) -> std::result::Result<(Selection, UpstreamSocket, HeaderMap), SocketError> {
         let mut excluded = Vec::new();
         loop {
-            match self.websocket(&account, identity, false, payload).await {
+            match self
+                .websocket(&account, identity, false, payload, responses_lite)
+                .await
+            {
                 Ok((socket, headers)) => return Ok((account, socket, headers)),
                 Err(SocketError::Cooldown(until)) => {
                     excluded.push(account.info.id);
@@ -767,6 +777,7 @@ impl Upstream {
         session: (&str, &str),
         http_fallback: bool,
         body: &Value,
+        responses_lite: bool,
     ) -> std::result::Result<(UpstreamSocket, HeaderMap), SocketError> {
         match self.check_cooldown(account).await {
             Ok(()) => {}
@@ -781,7 +792,7 @@ impl Upstream {
             let mut request = url.as_str().into_client_request()?;
             request
                 .headers_mut()
-                .extend(inference_headers(account, body)?);
+                .extend(inference_headers(account, body, responses_lite)?);
             session_headers(request.headers_mut(), session)?;
             request.headers_mut().insert(
                 "openai-beta",
@@ -994,13 +1005,14 @@ pub(crate) fn account_headers(account: &Account) -> Result<HeaderMap> {
     Ok(headers)
 }
 
-fn inference_headers(account: &Account, body: &Value) -> Result<HeaderMap> {
+fn inference_headers(account: &Account, body: &Value, responses_lite: bool) -> Result<HeaderMap> {
     let mut headers = account_headers(account)?;
-    // Current Codex carries tools and instructions in input for Responses Lite.
-    // A WS continuation may instead carry the mode in client_metadata.
-    let lite = body["input"]
-        .as_array()
-        .is_some_and(|input| input.iter().any(|item| item["type"] == "additional_tools"))
+    // Tool-free compaction/continuation may carry only the explicit Lite mode.
+    // Other native clients identify it through input or WS frame metadata.
+    let lite = responses_lite
+        || body["input"]
+            .as_array()
+            .is_some_and(|input| input.iter().any(|item| item["type"] == "additional_tools"))
         || body["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"]
             == "true";
     if lite {

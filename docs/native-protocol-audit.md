@@ -33,7 +33,7 @@ Native identity construction is explicit in Codex [requests/headers.rs](https://
 | `session-id`, legacy `session_id` | Stable scoped identity; distinguish cache affinity from authorization/account ownership. | Session hints and cache keys are scoped independently when native children share a parent cache. Existing cache digests/account preference remain stable. |
 | `thread-id` | Stable scoped thread identity. | HTTP/WS and per-frame hints now have a separate user/model HMAC domain. Parent/child/shared-cache, rotation, user isolation and restart fixtures pass. Impact on the observed stalls is not proven. |
 | `x-codex-turn-state` | Preserve an issued opaque token transiently; validate owner before forwarding; persist only its keyed digest. | HTTP headers, WS handshake response.metadata after response.created and event metadata bind issued state before forwarding. WS-to-HTTP/new-WS/restart ownership fixture passes, including upgrade-header projection into a frame. |
-| `x-openai-internal-codex-responses-lite` | Enable only for the recognized native Lite shape/mode. | Derived from `additional_tools` or native WS mode metadata. Explicit mode without these witnesses is rejected before submission. |
+| `x-openai-internal-codex-responses-lite` | Preserve the recognized native Lite mode independently of tool inventory. | Derived from `additional_tools`, native WS mode metadata or an explicit `true` header. See the targeted follow-up below; the original witness-only validation rejected valid prefix-free requests. |
 | `x-codex-beta-features` | Advertise implemented capabilities. | `remote_compaction_v2` implemented; do not advertise arbitrary client features. |
 | `x-client-request-id`, parent/subagent/turn metadata | Treat as bounded metadata, never as authorization or a reason to move accounts. | Not forwarded as arbitrary headers. Source presence alone is not proof that each is required for generation. |
 | Response model/reasoning/rate-limit headers | Project a reviewed bounded subset when native client behavior needs it; exclude credentials and arbitrary payloads. | Router accounts for quotas; downstream projects bounded model/etag/reasoning metadata and validated turn state. Credentials/arbitrary headers are excluded; dedicated fixture passes. |
@@ -61,6 +61,14 @@ The additional pinned [responses_metadata.rs](https://github.com/openai/codex/bl
 ## Acceptance status
 
 Bounded compression, scoped identities, turn-state ownership, Lite/metadata negotiation and broader native item fixtures are implemented. The [development plan](development-plan.md#sustained-sessions-and-failure-behavior) tracks remaining acceptance: full model windows, large tool output, multi-hour sessions, saturation and actual upstream outages.
+
+## Targeted Lite follow-up — October 23, 2026
+
+The current stable Codex npm release was resolved to **0.164.0**, tag `rust-v0.164.0`, commit `6aaac694803004a63c6f393d153c96d22521a6b9`. This is a targeted source review, not a replacement for the broader execution matrix above or verification of Codex Desktop's bundled runtime.
+
+In that revision, [client.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/core/src/client.rs) adds an `additional_tools` prefix only when the Lite prompt's tool list is nonempty. Its HTTP options still send the Lite header according to the model's mode, independently of that prefix. [V2 compaction](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/core/src/compact_remote_v2.rs) uses ordinary Responses streaming; background compaction uses the HTTP executor. A missing visible tool inventory therefore does not prove that an explicit Lite request is invalid.
+
+The router accepts only the exact explicit mode `true` and constructs the corresponding upstream header, including replacement WS handshakes. It does not synthesize tools, copy arbitrary headers or bypass opaque-context/turn-state ownership. Offline fixtures cover prefix-free HTTP compaction through both Responses routes, subsequent checkpoint use, WS reconnection and quota transfer. They do not constitute a Desktop execution test.
 
 ## Evidence and repeatable review
 

@@ -90,7 +90,7 @@ Idle metadata is retained as at most one 64 KiB transient notification and deliv
 
 When the latest completed context is recoverable, an upstream WS is proactively retired after 30 seconds between requests or five minutes of connection age. An active response is never retired by these limits. The downstream connection remains open; its next request recovers complete context on the same eligible account, without forwarding old socket-specific response IDs or turn state. If no recoverable snapshot exists, proactive retirement is skipped.
 
-Responses Lite preserves its ordered `additional_tools` prefix and custom/namespace definitions. An explicit Lite header needs a recognized native prefix or frame-mode metadata; arbitrary caller headers are not forwarded.
+Responses Lite preserves its ordered `additional_tools` prefix and custom/namespace definitions. The explicit `x-openai-internal-codex-responses-lite: true` mode is preserved even without a visible tool prefix, including compaction and prefix-free continuations. Without that header, the router derives Lite mode from the native prefix or recognized frame-mode metadata. Other explicit Lite values are rejected; arbitrary caller headers are not forwarded. Context ownership checks remain unchanged.
 
 Compact appends `compaction_trigger` to one Responses SSE request and projects `response.compaction` with exactly one opaque checkpoint. Independent requests may select another eligible account; normal checkpoint/socket affinity takes precedence over cache preference.
 

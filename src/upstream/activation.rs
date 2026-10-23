@@ -81,7 +81,14 @@ impl Upstream {
             let order = self.db.call(|conn| crate::health::next(conn)).await?;
             let body = json!({"model":MODEL,"instructions":"Reply with exactly OK.","input":[{"role":"user","content":[{"type":"input_text","text":"OK"}]}],"reasoning":{"effort":"low"},"store":false,"stream":true});
             let response = self
-                .post(&selected, "responses", &body, None, order, None)
+                .post(
+                    &selected,
+                    "responses",
+                    &body,
+                    None,
+                    order,
+                    Default::default(),
+                )
                 .await?;
             let generation = selected.info.generation;
             let now = Utc::now().timestamp();
