@@ -186,7 +186,7 @@ pub async fn serve(
     let recovered = state
         .db
         .call(|conn| {
-            crate::affinity::prune_transfers(conn, chrono::Utc::now().timestamp())?;
+            crate::affinity::prune_transfers(conn)?;
             crate::usage::recover_requests(conn)
         })
         .await?;
@@ -274,7 +274,7 @@ pub(crate) async fn local_api(
         stopped: stopped.clone(),
     });
     db.call(|conn| {
-        crate::affinity::prune_transfers(conn, chrono::Utc::now().timestamp())?;
+        crate::affinity::prune_transfers(conn)?;
         crate::usage::recover_requests(conn)
     })
     .await?;

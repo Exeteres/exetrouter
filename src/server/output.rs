@@ -34,6 +34,8 @@ pub(super) fn compaction(response: &Value) -> Result<Value> {
 pub(super) struct CompletionOutput {
     items: BTreeMap<u64, Value>,
     bytes: usize,
+    routing_bytes: usize,
+    routing_items: u64,
 }
 impl CompletionOutput {
     pub fn observe(&mut self, event: &mut Value) -> Result<()> {
@@ -41,7 +43,7 @@ impl CompletionOutput {
             Some("response.output_item.done") => {
                 let index = event["output_index"]
                     .as_u64()
-                    .filter(|index| *index < 1024)
+                    .filter(|index| *index < 1024 + self.routing_items)
                     .ok_or("invalid completed output index")?;
                 let item = event
                     .get("item")
@@ -54,10 +56,21 @@ impl CompletionOutput {
                     return Ok(());
                 }
                 let bytes = serde_json::to_vec(item)?.len() + 1;
-                if self.bytes.saturating_add(bytes) > crate::payload::PROJECTED_OUTPUT_BYTES {
+                let (used, limit) = if crate::affinity::is_transfer_item(item) {
+                    (
+                        &mut self.routing_bytes,
+                        crate::affinity::TRANSFER_OUTPUT_BYTES,
+                    )
+                } else {
+                    (&mut self.bytes, crate::payload::PROJECTED_OUTPUT_BYTES)
+                };
+                if used.saturating_add(bytes) > limit {
                     return Err("assembled output exceeds 1 MiB".into());
                 }
-                self.bytes += bytes;
+                *used += bytes;
+                if crate::affinity::is_transfer_item(item) {
+                    self.routing_items += 1;
+                }
                 self.items.insert(index, item.clone());
             }
             Some("response.completed" | "response.incomplete") => {

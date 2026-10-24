@@ -102,16 +102,24 @@ impl Window {
         let Value::Array(mut output) = output else {
             return None;
         };
-        if combined
-            .len()
-            .saturating_add(input.len())
-            .saturating_add(output.len())
-            > ITEMS
-        {
-            return None;
-        }
         combined.append(&mut input);
         combined.append(&mut output);
+        // A newly issued routing receipt is present in the dispatch-side input
+        // and the downstream output. Retain it once, as the client does.
+        let mut receipts = std::collections::BTreeSet::new();
+        combined.retain(|item| {
+            use sha2::Digest;
+            !crate::affinity::is_transfer_item(item)
+                || receipts.insert(<[u8; 32]>::from(sha2::Sha256::digest(
+                    item["encrypted_content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .as_bytes(),
+                )))
+        });
+        if combined.len() > ITEMS {
+            return None;
+        }
         let mut size = Size(0);
         serde_json::to_writer(&mut size, &combined).ok()?;
         // Old reservation is released before reserving the new complete window.

@@ -388,12 +388,14 @@ async fn responses(
         return (StatusCode::TOO_MANY_REQUESTS, headers, Json(json!({"error":{"type":"usage_limit_reached","resets_at":chrono::Utc::now().timestamp()+300}}))).into_response();
     }
     if mode == "rate_limit_reset"
-        || (mode == "quota_http_after_tool"
-            && body["input"].as_array().is_some_and(|input| {
-                input
-                    .iter()
-                    .any(|item| item["type"] == "function_call_output")
-            }))
+        || (matches!(
+            mode.as_str(),
+            "quota_http_after_tool" | "quota_http_proofs_after_tool"
+        ) && body["input"].as_array().is_some_and(|input| {
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        }))
     {
         return (StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"type":"usage_limit_reached","resets_at":chrono::Utc::now().timestamp()+300,"message":"Synthetic backend quota rejection"}}))).into_response();
     }
@@ -682,7 +684,12 @@ fn configured_events(
                     })),
         )
     };
-    if mode == "native_proofs" && body["generate"] != false && !is_compaction(body) {
+    if matches!(
+        mode,
+        "native_proofs" | "quota_proofs_after_tool" | "quota_http_proofs_after_tool"
+    ) && body["generate"] != false
+        && !is_compaction(body)
+    {
         let reasoning = json!({"type":"reasoning","id":format!("rs_{id}"),"summary":[],"encrypted_content":format!("synthetic-native-proof-{account}-{id}")});
         let tool_turn = events
             .iter()
@@ -696,7 +703,7 @@ fn configured_events(
                     .as_array_mut()
                     .unwrap()
                     .insert(0, reasoning.clone());
-                if tool_turn {
+                if tool_turn && mode == "native_proofs" {
                     event["response"]["usage"]["input_tokens"] = json!(50000);
                     event["response"]["usage"]["total_tokens"] = json!(50002);
                 }
@@ -787,8 +794,8 @@ fn configured_events(
                 events.splice(index..index,[json!({"type":"response.output_item.done","output_index":1,"item":reasoning}),json!({"type":"response.output_item.done","output_index":2,"item":checkpoint})]);
             }
         }
-        "quota_error" | "quota_after_tool" | "late_quota_error"
-            if mode != "quota_after_tool"
+        "quota_error" | "quota_after_tool" | "quota_proofs_after_tool" | "late_quota_error"
+            if !matches!(mode, "quota_after_tool" | "quota_proofs_after_tool")
                 || body["input"].as_array().is_some_and(|input| {
                     input
                         .iter()

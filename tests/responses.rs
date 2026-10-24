@@ -24,11 +24,21 @@ use tokio_tungstenite::{
 };
 
 // Strip the client-carried envelope only for assertions about exact upstream
-// forwarding. Authentication, tampering and expiry are exercised separately.
+// forwarding. Authentication, tampering and legacy expiry are exercised separately.
 fn upstream_value(value: &Value) -> Value {
     match value {
         Value::String(s) if s.starts_with("exrctx1.") => json!(s.splitn(3, '.').nth(2).unwrap()),
-        Value::Array(values) => Value::Array(values.iter().map(upstream_value).collect()),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .filter(|item| {
+                    !item["encrypted_content"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("exrtr1."))
+                })
+                .map(upstream_value)
+                .collect(),
+        ),
         Value::Object(values) => Value::Object(
             values
                 .iter()
@@ -37,6 +47,49 @@ fn upstream_value(value: &Value) -> Value {
         ),
         _ => value.clone(),
     }
+}
+
+// Independently encode a v1 fixture envelope whose legacy expiry is January 1970.
+fn legacy_context_proof(raw: &str, domain: &[u8], account: i64) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        XChaCha20Poly1305, XNonce,
+    };
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mac = |parts: &[&[u8]]| -> [u8; 32] {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[1; 32]).unwrap();
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().into()
+    };
+    let metadata = [
+        1_i64.to_be_bytes(),
+        account.to_be_bytes(),
+        1_i64.to_be_bytes(),
+    ]
+    .concat();
+    let nonce = mac(&[
+        b"exetrouter/context-proof/nonce/v1\0",
+        domain,
+        &metadata,
+        raw.as_bytes(),
+    ]);
+    let digest = mac(&[domain, &1_i64.to_be_bytes(), raw.as_bytes()]);
+    let key = mac(&[b"exetrouter/context-proof/encryption/v1\0"]);
+    let sealed = XChaCha20Poly1305::new((&key).into())
+        .encrypt(
+            XNonce::from_slice(&nonce[..24]),
+            Payload {
+                msg: &metadata,
+                aad: &digest,
+            },
+        )
+        .unwrap();
+    let header = [&nonce[..24], &sealed].concat();
+    format!("exrctx1.{}.{raw}", URL_SAFE_NO_PAD.encode(header))
 }
 
 struct Fixture {
@@ -3256,6 +3309,120 @@ async fn pool_compaction_routes_http_and_new_ws_to_its_account_after_restart() {
 }
 
 #[tokio::test]
+async fn legacy_expired_context_survives_restart_on_every_response_transport() {
+    let mut fixture = Fixture::start(false).await;
+    fixture.add_account(&["gpt-test"], false).await;
+    let content = legacy_context_proof("legacy-reasoning", b"exetrouter/context-affinity/v1\0", 2);
+    let arguments =
+        legacy_context_proof("legacy-arguments", b"exetrouter/function-affinity/v1\0", 2);
+    let turn = legacy_context_proof("legacy-turn", b"exetrouter/turn-affinity/v1\0", 2);
+    let conversation =
+        legacy_context_proof("conv_legacy", b"exetrouter/conversation-affinity/v1\0", 2);
+    let input = json!([
+        {"type":"reasoning","summary":[],"encrypted_content":content},
+        {"type":"function_call","call_id":"legacy-call","name":"fixture","arguments":"{}","encrypted_function_args":[arguments]},
+        {"type":"function_call_output","call_id":"legacy-call","output":"synthetic result"},
+        {"role":"user","content":"continue the saved context"}
+    ]);
+    for _ in 0..2 {
+        for surface in ["json", "sse", "compact", "ws"] {
+            let mut body = request();
+            body["input"] = input.clone();
+            body["stream"] = json!(surface == "sse");
+            body["conversation"] = json!({"id":conversation});
+            body["client_metadata"] = json!({"x-codex-turn-state":turn});
+            if surface == "ws" {
+                body["type"] = json!("response.create");
+                let mut socket = fixture.ws().await;
+                socket
+                    .send(Message::Text(body.to_string().into()))
+                    .await
+                    .unwrap();
+                let event = terminal(&mut socket).await;
+                assert_eq!(event["type"], "response.completed", "{event}");
+                socket.close(None).await.unwrap();
+            } else {
+                let route = if surface == "compact" {
+                    "responses/compact"
+                } else {
+                    "responses"
+                };
+                let response = reqwest::Client::new()
+                    .post(format!("{}/v1/{route}", fixture.url))
+                    .bearer_auth(&fixture.secret)
+                    .header("x-codex-turn-state", &turn)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200, "{surface}");
+                let wire = response.text().await.unwrap();
+                assert!(!wire.contains("response.failed"), "{wire}");
+                assert!(!wire.contains("context_not_found"), "{wire}");
+            }
+        }
+        fixture.restart().await;
+    }
+    let requests = fixture.mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 6);
+    assert!(requests
+        .iter()
+        .all(|body| body["input"] == upstream_value(&input)
+            && body["conversation"]["id"] == "conv_legacy"
+            && body["client_metadata"]["x-codex-turn-state"] == "legacy-turn"));
+    assert_eq!(
+        *fixture.mock.request_accounts.lock().unwrap(),
+        vec!["upstream-account-2"; 6]
+    );
+    assert_eq!(fixture.mock.compactions.lock().unwrap().len(), 2);
+    assert!(fixture
+        .mock
+        .compactions
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(account, _)| account == "upstream-account-2"));
+    fixture
+        .db
+        .call(|conn| {
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM context_bindings", [], |row| row
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(fixture.rows().await.len(), 8);
+    fixture
+        .db
+        .call(|conn| {
+            exetrouter::account_preferences::set_user(conn, 1, 2, Some(false), None)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut continuation = request();
+    continuation["input"] = input;
+    continuation["stream"] = json!(false);
+    assert_eq!(fixture.post(continuation.clone()).await.status(), 503);
+    let token = fixture.token_id.clone();
+    fixture
+        .db
+        .call(move |conn| {
+            exetrouter::account_preferences::set_user(conn, 1, 2, Some(true), None)?;
+            exetrouter::revoke_token(conn, 1, &token)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(fixture.post(continuation).await.status(), 401);
+    assert_eq!(fixture.rows().await.len(), 8);
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn pool_context_is_user_scoped_and_rejects_raw_and_mixed_items() {
     let fixture = Fixture::start(false).await;
     fixture
@@ -3352,6 +3519,171 @@ async fn pool_context_is_user_scoped_and_rejects_raw_and_mixed_items() {
     assert_eq!(fixture.rows().await.len(), 3);
     assert_eq!(fixture.mock.requests.lock().unwrap().len(), 1);
     fixture.stop().await;
+}
+
+#[tokio::test]
+async fn repeated_stateless_transfers_replay_on_all_transports_without_lifetime_registry_growth() {
+    for surface in ["json", "sse", "ws"] {
+        let mut fixture = Fixture::start(false).await;
+        fixture
+            .add_account(&["gpt-test", "gpt-second"], false)
+            .await;
+        fixture.first_profile(&["gpt-test", "gpt-second"], "");
+        let checkpoint = fixture
+            .compact(json!({"model":"gpt-test","input":[]}))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap()["output"]
+            .clone();
+        fixture.db.call(|conn| {conn.execute_batch("CREATE TRIGGER reject_context_write BEFORE INSERT ON context_bindings BEGIN SELECT RAISE(ABORT,'no context writes'); END;")?;Ok(())}).await.unwrap();
+        let mut body = request();
+        body["input"] = checkpoint;
+        body["test_mode"] = json!("native_proofs");
+        for n in 0..8 {
+            body["model"] = json!(if n % 2 == 0 { "gpt-test" } else { "gpt-second" });
+            let source = if n % 2 == 0 { 1 } else { 2 };
+            fixture.db.call(move |conn| {
+                let now = chrono::Utc::now().timestamp();
+                for id in [1,2] {
+                    conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(?1,'primary',?2,300,?3,?4,0) ON CONFLICT(account_id,kind) DO UPDATE SET used_percent=excluded.used_percent,reset_at=excluded.reset_at,observed_at=excluded.observed_at",rusqlite::params![id, if id==source {100.} else {0.},now+300,now])?;
+                }
+                Ok(())
+            }).await.unwrap();
+            body["stream"] = json!(surface == "sse");
+            let output = if surface == "ws" {
+                let mut wire_body = body.clone();
+                wire_body["type"] = json!("response.create");
+                let mut socket = fixture.ws().await;
+                socket
+                    .send(Message::Text(wire_body.to_string().into()))
+                    .await
+                    .unwrap();
+                let response = terminal(&mut socket).await;
+                assert_eq!(response["type"], "response.completed", "{response}");
+                socket.close(None).await.unwrap();
+                response["response"]["output"].clone()
+            } else {
+                let reply = fixture.post(body.clone()).await;
+                assert_eq!(reply.status(), 200);
+                if surface == "sse" {
+                    let wire = reply.text().await.unwrap();
+                    let events: Vec<Value> = wire
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|data| serde_json::from_str(data).ok())
+                        .collect();
+                    let added = events
+                        .iter()
+                        .find(|event| {
+                            event["type"] == "response.output_item.added"
+                                && event["output_index"] == 0
+                        })
+                        .unwrap();
+                    let done = events
+                        .iter()
+                        .find(|event| {
+                            event["type"] == "response.output_item.done"
+                                && event["output_index"] == 0
+                        })
+                        .unwrap();
+                    assert_eq!(added["item"], done["item"]);
+                    events
+                        .iter()
+                        .find(|event| event["type"] == "response.completed")
+                        .unwrap()["response"]["output"]
+                        .clone()
+                } else {
+                    reply.json::<Value>().await.unwrap()["output"].clone()
+                }
+            };
+            assert!(output[0]["encrypted_content"]
+                .as_str()
+                .unwrap()
+                .starts_with("exrtr1."));
+            body["input"]
+                .as_array_mut()
+                .unwrap()
+                .extend(output.as_array().unwrap().iter().cloned());
+            // An original turn token remains authenticated, but must not bind the
+            // complete, proven transferred history back to its retired account.
+            body["client_metadata"] = json!({"x-codex-turn-state":legacy_context_proof("old-turn",b"exetrouter/turn-affinity/v1\0",source)});
+            fixture.restart().await;
+            let mut continuation = body.clone();
+            continuation["model"] = json!(if n % 2 == 0 { "gpt-second" } else { "gpt-test" });
+            continuation["stream"] = json!(false);
+            let response = fixture.post(continuation).await;
+            assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+            let calls = fixture.mock.requests.lock().unwrap().clone();
+            assert_eq!(
+                calls.last().unwrap()["input"],
+                upstream_value(&body["input"])
+            );
+            assert_eq!(
+                calls.last().unwrap()["model"],
+                if n % 2 == 0 { "gpt-second" } else { "gpt-test" }
+            );
+            assert!(calls
+                .last()
+                .unwrap()
+                .pointer("/client_metadata/x-codex-turn-state")
+                .is_none());
+            assert_eq!(
+                fixture
+                    .mock
+                    .request_accounts
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap(),
+                if source == 1 {
+                    "upstream-account-2"
+                } else {
+                    "upstream-account"
+                }
+            );
+            fixture
+                .db
+                .call(|conn| {
+                    assert_eq!(
+                        conn.query_row("SELECT COUNT(*) FROM context_bindings", [], |r| r
+                            .get::<_, i64>(0))?,
+                        0
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            body.as_object_mut().unwrap().remove("client_metadata");
+        }
+        // Compaction consumes the receipts locally and replaces them with exactly
+        // one normal checkpoint. The backend never receives router-only items.
+        let compact = fixture
+            .compact(json!({"model":"gpt-test","input":body["input"]}))
+            .await;
+        assert_eq!(compact.status(), 200);
+        let output = compact.json::<Value>().await.unwrap()["output"].clone();
+        assert_eq!(output.as_array().unwrap().len(), 1);
+        assert!(output[0]["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .starts_with("exrctx1."));
+        assert!(!fixture
+            .mock
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|body| body.to_string().contains("exrtr1.")));
+        assert!(!fixture
+            .mock
+            .compactions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body.to_string().contains("exrtr1.")));
+        fixture.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -3734,7 +4066,7 @@ async fn full_transfer_registry_does_not_interrupt_new_proofs_on_any_transport()
 }
 
 #[tokio::test]
-async fn full_transfer_registry_rejects_before_replacement_generation() {
+async fn full_legacy_transfer_registry_does_not_block_stateless_replacement_generation() {
     let fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     let checkpoint = fixture
@@ -3754,23 +4086,25 @@ async fn full_transfer_registry_rejects_before_replacement_generation() {
     body["input"] = checkpoint;
     body["stream"] = json!(false);
     let reply = fixture.post(body.clone()).await;
-    assert_eq!(reply.status(), 503);
-    assert_eq!(
-        reply.json::<Value>().await.unwrap()["error"]["code"],
-        "context_transfer_storage_full"
-    );
+    assert_eq!(reply.status(), 200);
+    let output = reply.json::<Value>().await.unwrap()["output"].clone();
+    assert!(output[0]["encrypted_content"]
+        .as_str()
+        .unwrap()
+        .starts_with("exrtr1."));
+    body["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(output.as_array().unwrap().iter().cloned());
     body["type"] = json!("response.create");
     let mut socket = fixture.ws().await;
     socket
         .send(Message::Text(body.to_string().into()))
         .await
         .unwrap();
-    assert_eq!(
-        terminal(&mut socket).await["error"]["code"],
-        "context_transfer_storage_full"
-    );
-    assert!(fixture.mock.requests.lock().unwrap().is_empty());
-    assert_eq!(fixture.rows().await.len(), 1);
+    assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+    assert_eq!(fixture.mock.requests.lock().unwrap().len(), 2);
+    assert_eq!(fixture.rows().await.len(), 3);
     fixture
         .db
         .call(|conn| {
@@ -5714,7 +6048,7 @@ async fn quota_refusal_recovers_incremental_tool_result_on_the_same_client_socke
 }
 
 #[tokio::test]
-async fn exhausted_subscription_moves_known_checkpoint_without_rewriting_it_or_expiry() {
+async fn exhausted_subscription_moves_checkpoint_without_rewriting_or_expiring_ownership() {
     let fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     let checkpoint = fixture
@@ -5724,7 +6058,6 @@ async fn exhausted_subscription_moves_known_checkpoint_without_rewriting_it_or_e
         .await
         .unwrap()["output"][0]
         .clone();
-    let expiry = chrono::Utc::now().timestamp() + 86400;
     fixture.db.call(|conn| {
         let now = chrono::Utc::now().timestamp();
         conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(1,'primary',100,300,?1,?2,0)",rusqlite::params![now+300,now])?;
@@ -5745,13 +6078,11 @@ async fn exhausted_subscription_moves_known_checkpoint_without_rewriting_it_or_e
     fixture
         .db
         .call(move |conn| {
-            let (owner, actual): (i64, i64) = conn.query_row(
-                "SELECT account_id,expires_at FROM context_bindings LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            assert_eq!(owner, 2);
-            assert!((expiry - 2..=expiry).contains(&actual));
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM context_bindings", [], |row| row
+                    .get::<_, i64>(0))?,
+                0
+            );
             Ok(())
         })
         .await
@@ -5852,6 +6183,147 @@ async fn current_clients_continue_tools_across_a_quota_account_switch() {
         println!(
             "{}",
             json!({"check":"native_quota_switch","client":client,"websocket":websocket,"requests":rows.len(),"accepted_continuations":1})
+        );
+        drop(probe);
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires exact Codex 0.164.0/OpenCode 2.1.4 runtimes; isolated synthetic backend only"]
+async fn native_clients_retain_stateless_transfer_receipts_after_router_and_process_restart() {
+    let codex = std::env::var("EXETROUTER_CODEX_BIN").expect("EXETROUTER_CODEX_BIN");
+    let opencode = std::env::var("EXETROUTER_OPENCODE_BIN").expect("EXETROUTER_OPENCODE_BIN");
+    for (client, websocket) in [
+        ("codex", false),
+        ("codex", true),
+        ("opencode", false),
+        ("opencode", true),
+    ] {
+        let (binary, version) = if client == "codex" {
+            (&codex, "0.164.0")
+        } else {
+            (&opencode, "2.1.4")
+        };
+        native::version(binary, version).await.unwrap();
+        let mut fixture = Fixture::start(false).await;
+        fixture
+            .add_account(&["gpt-test", "gpt-second"], false)
+            .await;
+        fixture.first_profile(
+            &["gpt-test", "gpt-second"],
+            if websocket {
+                "quota_proofs_after_tool"
+            } else {
+                "quota_http_proofs_after_tool"
+            },
+        );
+        fixture
+            .mock
+            .accounts
+            .lock()
+            .unwrap()
+            .get_mut("upstream-account-2")
+            .unwrap()
+            .mode = "native_proofs".into();
+        fixture.db.call(|conn| {
+            exetrouter::account_preferences::set_user(conn, 1, 1, None, Some(10))?;
+            conn.execute_batch("CREATE TRIGGER no_context_insert BEFORE INSERT ON context_bindings BEGIN SELECT RAISE(ABORT,'no context writes'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        fixture.mock.tools.store(true, Ordering::SeqCst);
+        let probe = probe::Probe::bounded(&fixture.url, 20).await.unwrap();
+        for (resume, model) in [
+            (false, "gpt-test"),
+            (true, "gpt-test"),
+            (true, "gpt-second"),
+            (true, "gpt-test"),
+        ] {
+            let output = native::Run {
+                binary,
+                client,
+                url: &probe.url,
+                model,
+                bearer: &fixture.secret,
+                websocket,
+                directory: fixture.dir.path(),
+                prompt: "Run the local compatibility fixture and report the result.",
+            }
+            .continued(&native::Continuation {
+                token_limit: 40000,
+                resume,
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("EXETROUTER_SMOKE_OK"),
+                "{client} ws={websocket} resume={resume} model={model}: {}",
+                native::diagnostic(&output.stdout),
+            );
+            if resume {
+                let calls = fixture.mock.requests.lock().unwrap();
+                let last = calls.last().unwrap();
+                assert_eq!(last["model"], model);
+                assert!(last["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output"));
+                // OpenCode intentionally omits model-bound encrypted reasoning
+                // when switching models, then reuses it on switching back.
+                if model == "gpt-test" || client == "codex" {
+                    assert!(last["input"].as_array().unwrap().iter().any(|item| item
+                        ["encrypted_content"]
+                        .as_str()
+                        .is_some_and(
+                            |raw| raw.contains("synthetic-native-proof-upstream-account-")
+                        )));
+                }
+            }
+            if !resume {
+                assert!(native::tool_result(&output.stdout));
+                fixture.restart().await;
+            }
+        }
+        let calls = fixture.mock.requests.lock().unwrap().clone();
+        let last = calls.last().unwrap();
+        assert_eq!(last["model"], "gpt-test");
+        assert!(last["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["encrypted_content"]
+                .as_str()
+                .is_some_and(|raw| raw.contains("synthetic-native-proof-upstream-account-"))));
+        assert!(!calls
+            .iter()
+            .any(|call| call.to_string().contains("exrtr1.")));
+        assert_eq!(
+            fixture
+                .mock
+                .request_accounts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap(),
+            "upstream-account-2"
+        );
+        fixture
+            .db
+            .call(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM context_bindings", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        println!(
+            "{}",
+            json!({"check":"stateless_transfer_resume","client":client,"version":version,"websocket":websocket,"requests":fixture.rows().await.len()})
         );
         drop(probe);
         fixture.stop().await;
@@ -6211,10 +6683,12 @@ async fn soft_threshold_migrates_checkpoint_forks_without_replaying_or_losing_ow
     configure_soft_threshold(&fixture, 1, 80., 0).await;
     let mut body = request();
     body["stream"] = json!(false);
+    body["test_mode"] = json!("native_proofs");
     body["input"] = json!([checkpoint,{"role":"user","content":"fork"}]);
     let (a, b) = tokio::join!(fixture.post(body.clone()), fixture.post(body.clone()));
     assert_eq!(a.status(), 200);
     assert_eq!(b.status(), 200);
+    let output = a.json::<Value>().await.unwrap()["output"].clone();
     assert!(fixture
         .mock
         .request_accounts
@@ -6230,8 +6704,34 @@ async fn soft_threshold_migrates_checkpoint_forks_without_replaying_or_losing_ow
         .iter()
         .all(|request| request["input"][0] == upstream_value(&checkpoint)));
     assert_eq!(fixture.rows().await.len(), 3);
+    body["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend(output.as_array().unwrap().iter().cloned());
+    fixture
+        .db
+        .call(|conn| {
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM context_bindings", [], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(fixture.post(body.clone()).await.status(), 200);
     fixture.restart().await;
-    assert_eq!(fixture.post(body).await.status(), 200);
+    assert_eq!(fixture.post(body.clone()).await.status(), 200);
+    body["type"] = json!("response.create");
+    let mut socket = fixture.ws().await;
+    socket
+        .send(Message::Text(body.to_string().into()))
+        .await
+        .unwrap();
+    let event = terminal(&mut socket).await;
+    assert_eq!(event["type"], "response.completed", "{event}");
+    socket.close(None).await.unwrap();
     assert_eq!(
         fixture
             .mock
