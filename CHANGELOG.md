@@ -2,8 +2,10 @@
 
 ## Unreleased
 
+- Remove the router's 24-hour opaque-context expiry, including for already-issued authenticated reasoning, compaction, encrypted tool arguments, turn state and saved conversation envelopes. Replace new per-element transfer registry writes with encrypted client-carried portability receipts, retaining legacy overrides without growing their registry. Preserve forks, restart/reopen, current authorization and account affinity without changing keys or schema. Older binaries cannot read the new transfer receipts; see the account-pool rollback contract.
 - Preserve explicitly requested Responses Lite mode without requiring a visible tool prefix, including compaction, continuations and replacement WebSocket handshakes. Keep opaque-context ownership checks and arbitrary-header filtering unchanged.
 - Authenticate and discard retired WebSocket turn state before checking full-context ownership after an authorized account transfer, avoiding false mixed-account errors when native clients replay their original turn token.
+- Recover the Docker API and restricted SSH gateway after transient boot failures. Recreate the runtime directory before the systemd sandbox is prepared, retain bounded restart attempts and cover a missing boot-time runtime directory in the isolated unit fixture.
 
 ## 0.5.4
 

@@ -24,7 +24,7 @@ Scope `session-id`, `thread-id`, legacy `session_id`, reviewed frame fields and 
 
 `x-codex-turn-state` is an issued continuation value, accepted only after owner/account validation. HTTP returns it as a header; WS exposes handshake metadata after `response.created`. Require authenticated client-carried envelopes without per-output registry writes; reject raw unwrapped state and keep upstream values transient. The [API contract](openai-api.md#native-routing-metadata) defines header projection, binding failures and quota-transfer behavior.
 
-Opaque reasoning, compaction and encrypted function arguments are returned in authenticated router envelopes and restored to their original values before upstream dispatch. Legacy ownership digests remain accepted. The [account-pool contract](account-pool.md#opaque-context) defines expiry, bounds and concurrent-fork portability.
+Opaque reasoning, compaction and encrypted function arguments are returned in authenticated router envelopes and restored to their original values before upstream dispatch. Raw values remain unsupported even when legacy ownership digests exist. Authenticated ownership does not expire in the router, including for previously issued envelopes. The [account-pool contract](account-pool.md#opaque-context) defines persistence, bounds and concurrent-fork portability.
 
 ## Quotas and cooldown
 

@@ -19,6 +19,7 @@ Remaining acceptance:
 - Timeouts, slow clients, reconnects, concurrent services and unavailable WS recovery windows.
 - Actual upstream authentication/quota failures when available, without deliberately exhausting a subscription.
 - Live WS encrypted-function-argument portability and multi-hour/concurrent failover.
+- Live multi-hour/repeated-transfer validation of client-carried portability receipts, including compaction and reconnect. New transfers no longer grow the legacy registry; ordinary tests verify repeated transfers without context writes.
 
 Require bounded memory/tasks/queues, correct unknown usage, normal affinity, authorized quota-only transfers. Give explicit recovery instructions when an owned WS cannot resume. The optional two-hour idle harness is implemented but has not been run for that duration.
 

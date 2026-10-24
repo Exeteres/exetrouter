@@ -27,7 +27,7 @@ Catalogs are merged across active accounts. Selection respects the requested mod
 
 Native WS opens upstream after the first model-bearing response.create. HTTP Responses uses upstream SSE and can return raw SSE or assembled terminal JSON. Chat first tries upstream WS, with HTTP/SSE fallback only after an ordinary handshake failure **before** inference submission. Handshake authentication/quota failures prevent fallback.
 
-Opaque output is fingerprinted with a user-scoped HMAC and bound to its originating account for 24 hours. Checkpoint data and prompts are not persisted. WS response IDs belong to that socket only. New sockets require full context or a known checkpoint; HTTP previous_response_id is unsupported.
+Opaque output carries a user-scoped authenticated ownership envelope bound to its originating account without router-side expiry. Proofs survive restart with the existing key and user/account state. Explicit transfers issue encrypted client-carried receipts proving exact ancestor portability, without new database rows. The finite legacy transfer registry remains readable for existing histories. Checkpoint data and prompts are not persisted. WS response IDs belong to that socket only. New sockets require full context or an authenticated checkpoint; HTTP previous_response_id is unsupported.
 
 ## Storage and accounting
 
