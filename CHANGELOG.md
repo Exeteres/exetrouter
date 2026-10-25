@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.7.0
+
+- Replace manual account priorities and switching rules with automatic deadline-aware routing. Use short-window subscriptions before weekly-only reserves, return recoverable sessions to restored short windows, and prioritize expiring credits/weekly refreshes within 72 hours. Use ordinary quota through exhaustion; strategic reset inventory never affects ranking.
+- Automatically spend only expiring reset credits: <72 hours and ≤1% weekly remaining, or one final-day salvage for the already-expiring cohort. Require new depletion before spending further cohort credits. Remove manual redemption controls.
+- Add randomized live preflight, account/weekly-cycle cross-host idempotency, durable recovery and inventory fences, and safe reconsideration of confirmed no-ops. Verify recovery after successful as well as uncertain submissions. Document upstream consistency and independent-host history limits.
+- Preserve quota-window absence ordering against late observations. Introduce schema 12 with a reviewed additive migration and rollback; routine Docker updates still refuse an unreviewed schema change.
+
 ## 0.6.0
 
 - Remove the router's 24-hour opaque-context expiry, including for already-issued authenticated reasoning, compaction, encrypted tool arguments, turn state and saved conversation envelopes. Replace new per-element transfer registry writes with encrypted client-carried portability receipts, retaining legacy overrides without growing their registry. Preserve forks, restart/reopen, current authorization and account affinity without changing keys or schema. Older binaries cannot read the new transfer receipts; see the account-pool rollback contract.
