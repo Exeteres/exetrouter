@@ -286,10 +286,7 @@ pub(super) fn limits(v: &Value) -> String {
             )
         ));
         if account["preference"].is_object() {
-            text.push_str(&format!(
-                "  Priority {}\n",
-                field(&account["preference"], "priority"),
-            ));
+            text.push_str(&format!("  Routing: {}\n", account_routing(account),));
         }
         let q = &account["quota"];
         let windows = visible_windows(q);
@@ -326,7 +323,7 @@ pub(super) fn limits(v: &Value) -> String {
         }
         text.push('\n');
     }
-    text.push_str("Only windows with a reported duration appear. Stale/reset-elapsed values are historical.\nLive limits may activate an unused weekly window with one minimal gpt-5.6-sol request.\nUse a credit: exr limits reset <email> (requires confirmation and ≤5% remaining).");
+    text.push_str("Only windows with a reported duration appear. Stale/reset-elapsed values are historical.\nLive limits may activate an unused weekly window with one minimal gpt-5.6-sol request.\nExpiring reset credits are managed automatically by the running API.");
     text
 }
 pub(super) fn weekly_activation(account: &Value) -> Option<String> {
@@ -361,28 +358,21 @@ pub(super) fn reset_credits(account: &Value) -> String {
     }
     text
 }
-pub(super) fn reset_confirmation(v: &Value) -> String {
-    let mut text = format!("Account: {}\n{} remaining · {} reset credits available\nUse one credit: {}\nFree reset: {}\nCredit expires: {}\n",
-        field(v,"email"),percent(&v["remaining_percent"]),field(v,"available_count"),field(v,"credit_title"),date(&v["free_reset_at"]),
-        if v["credit_expires_at"].is_null(){"No expiry reported".into()}else{date(&v["credit_expires_at"])});
-    if v["recommend_wait"] == true {
-        text.push_str("\nFree reset is less than 3 days away. We recommend saving this credit and waiting for the free reset.\n");
-    }
-    text.push_str("\nThis consumes one credit. Confirm within 2 minutes.");
-    text
-}
-pub(super) fn reset_outcome(v: &Value) -> String {
-    match v["code"].as_str() {
-        Some("reset") => format!(
-            "Reset credit used. {} subscription windows reset.",
-            field(v, "windows_reset")
-        ),
-        Some("nothing_to_reset") => "No subscription windows needed a reset.".into(),
-        Some("no_credit") => "No reset credit available. Refresh limits.".into(),
-        Some("already_redeemed") => {
-            "This reset request was already redeemed. Refresh limits.".into()
-        }
-        _ => "Reset outcome unknown. Refresh limits before any further action.".into(),
+pub(super) fn account_routing(account: &Value) -> String {
+    let reason = match account["routing"]["reason"].as_str() {
+        Some("reset_expiring") => "Urgent · reset expiring",
+        Some("weekly_reset_soon") => "Urgent · weekly reset soon",
+        Some("short_window_first") => "Short window first",
+        Some("reserve") => "Reserve",
+        _ => "Automatic · metadata unknown",
+    };
+    let status = account["automatic_reset"]["status"]
+        .as_str()
+        .unwrap_or("idle");
+    if status == "idle" {
+        reason.into()
+    } else {
+        format!("{reason} · auto reset: {}", safe(status))
     }
 }
 

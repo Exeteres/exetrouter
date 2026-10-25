@@ -153,10 +153,13 @@ pub fn control(
             &routing.unwrap_or_default(),
         )?)?,
         ControlRequest::Models => serde_json::json!({"data":[],"object":"list"}),
-        ControlRequest::Doctor
-        | ControlRequest::Limits
-        | ControlRequest::ResetPrepare { .. }
-        | ControlRequest::ResetConfirm { .. } => {
+        ControlRequest::ResetPrepare { .. } | ControlRequest::ResetConfirm { .. } => {
+            return Err(
+                "Reset credits are managed automatically; manual redemption is no longer supported"
+                    .into(),
+            )
+        }
+        ControlRequest::Doctor | ControlRequest::Limits => {
             return Err("request requires the running service".into())
         }
     };

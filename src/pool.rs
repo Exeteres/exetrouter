@@ -8,7 +8,7 @@ use std::{
 pub(crate) struct Candidate {
     pub id: i64,
     pub quota: Option<f64>,
-    pub priority: i32,
+    pub routing: crate::routing::Decision,
 }
 
 #[derive(Default)]
@@ -36,7 +36,7 @@ impl Pool {
         // Use quota ranking only when every candidate has a fresh observation.
         let all_known = candidates.iter().all(|candidate| candidate.quota.is_some());
         let selected = candidates.iter().min_by(|a, b| {
-            let priority = b.priority.cmp(&a.priority);
+            let priority = a.routing.compare(&b.routing);
             if priority != std::cmp::Ordering::Equal {
                 return priority;
             }
@@ -54,9 +54,11 @@ impl Pool {
                 return score(b.id).cmp(&score(a.id)).then_with(|| a.id.cmp(&b.id));
             }
             let quota = if all_known {
-                a.quota
+                // Candidate quota is USED percentage. Finish the more consumed
+                // account within this economic tier instead of spreading use.
+                b.quota
                     .expect("all known")
-                    .total_cmp(&b.quota.expect("all known"))
+                    .total_cmp(&a.quota.expect("all known"))
             } else {
                 std::cmp::Ordering::Equal
             };
@@ -99,11 +101,11 @@ mod tests {
             Candidate {
                 id: 1,
                 quota: None,
-                priority: 0,
+                routing: Default::default(),
             },
             Candidate {
                 id: 2,
-                priority: 0,
+                routing: Default::default(),
                 quota: Some(50.0),
             },
         ];
@@ -121,18 +123,21 @@ mod tests {
     }
 
     #[test]
-    fn explicit_priority_precedes_quota_load_and_soft_cache_affinity() {
+    fn automatic_routing_precedes_quota_load_and_soft_cache_affinity() {
         let pool = Pool::default();
         let candidates = [
             Candidate {
                 id: 1,
                 quota: Some(0.),
-                priority: 0,
+                routing: Default::default(),
             },
             Candidate {
                 id: 2,
                 quota: Some(90.),
-                priority: 1,
+                routing: crate::routing::Decision {
+                    urgent: true,
+                    ..Default::default()
+                },
             },
         ];
         for hint in [None, Some("synthetic-cache")] {
@@ -145,30 +150,30 @@ mod tests {
         let candidates = [
             Candidate {
                 id: 1,
-                priority: 0,
+                routing: Default::default(),
                 quota: Some(70.0),
             },
             Candidate {
                 id: 2,
-                priority: 0,
+                routing: Default::default(),
                 quota: Some(20.0),
             },
         ];
         let first = pool.reserve(&candidates).unwrap();
         let second = pool.reserve(&candidates).unwrap();
-        assert_eq!((first.id, second.id), (2, 2));
+        assert_eq!((first.id, second.id), (1, 1));
         let tied = [
             Candidate {
                 id: 1,
-                priority: 0,
+                routing: Default::default(),
                 quota: Some(20.0),
             },
             Candidate {
                 id: 2,
-                priority: 0,
+                routing: Default::default(),
                 quota: Some(20.0),
             },
         ];
-        assert_eq!(pool.reserve(&tied).unwrap().id, 1);
+        assert_eq!(pool.reserve(&tied).unwrap().id, 2);
     }
 }

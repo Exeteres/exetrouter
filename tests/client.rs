@@ -27,8 +27,6 @@ case "$request" in
   *'"action":"models"'*) printf '%s' '{"ok":true,"result":{"data":[{"id":"gpt-test","object":"model","owned_by":"openai","display_name":"Test model","exetrouter":{"context_window":100000,"input_modalities":["text","image"],"supported_reasoning_levels":[{"effort":"low"}],"default_reasoning_level":"low"}},{"id":"gpt-other","object":"model","owned_by":"openai","display_name":"Other model","exetrouter":{"context_window":200000,"input_modalities":["text"],"supported_reasoning_levels":[{"effort":"high"}]}}]}}' ;;
   *'"action":"doctor"'*|*'"action":"limits"'*) printf '%s' '{"ok":true,"result":{"capabilities":{"account_routing_rules":1},"quota_accounts":[{"id":1,"label":"test@example.com","preference":{"enabled":true,"priority":1,"locked":false,"rules":{"switch_at":null,"switch_at_short":null,"switch_at_weekly":null},"settings":{}},"reset_credits":{"available_count":2,"credits":[]},"quota":{"status":"current","windows":[{"kind":"primary","window_minutes":480,"used_percent":20,"remaining_percent":80,"status":"current"},{"kind":"secondary","window_minutes":10080,"used_percent":30,"remaining_percent":70,"status":"stale"}]}}]}}' ;;
   *'"action":"account_set"'*) printf '%s' '{"ok":true,"result":{"enabled":true,"priority":-255,"locked":false,"rules":{"switch_at":20,"switch_at_short":-1,"switch_at_weekly":15},"settings":{"priority":-255,"switch_at":20,"switch_at_short":"off","switch_at_weekly":15}}}' ;;
-  *'"action":"reset_prepare"'*) printf '%s' '{"ok":true,"result":{"confirmation":"synthetic-confirmation","email":"test@example.com","remaining_percent":5,"available_count":2,"credit_title":"Full reset","free_reset_at":2000000000,"recommend_wait":true,"credit_expires_at":null}}' ;;
-  *'"action":"reset_confirm"'*) printf '%s' '{"ok":true,"result":{"code":"reset","windows_reset":2}}' ;;
   *'"action":"usage"'*'"by":"token"'*) printf '%s' '{"ok":true,"result":{"period":"day","timezone":"Europe/Moscow","rows":[{"name":"tok_test","display_name":"Laptop","requests":3,"input_tokens":10,"output_tokens":2}]}}' ;;
   *'"action":"usage"'*) printf '%s' '{"ok":true,"result":{"period":"day","timezone":"Europe/Moscow","rows":[]}}' ;;
   *'"action":"token_create"'*) printf '%s' '{"ok":true,"result":{"token":{"id":"tok_created"},"secret":"SYNTHETIC_TEST_SECRET"}}' ;;
@@ -497,26 +495,17 @@ fn real_terminal_dashboard_copies_secrets_without_rendering_and_restores_screen(
     }
     clear_history(&mut output);
     master.write_all(b"\r").unwrap();
-    wait(&mut master, &mut output, "Review reset credit");
-    master.write_all(b"\r").unwrap();
-    wait(&mut master, &mut output, "recommend saving");
+    wait(&mut master, &mut output, "Deactivate for me");
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()
         .contains("reset_confirm"));
-    master.write_all(b"n").unwrap();
+    master.write_all(b"\x1b").unwrap();
     std::thread::sleep(Duration::from_millis(150));
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()
         .contains("reset_confirm"));
     clear_history(&mut output);
-    master.write_all(b"\r").unwrap();
-    wait(&mut master, &mut output, "Review reset credit");
-    master.write_all(b"\r").unwrap();
-    wait(&mut master, &mut output, "recommend saving");
-    clear_history(&mut output);
-    master.write_all(b"y").unwrap();
-    wait(&mut master, &mut output, "Reset credit used");
-    clear_history(&mut output);
+    master.write_all(b"cS").unwrap();
     master.write_all(b"q").unwrap();
     wait(&mut master, &mut output, "\x1b[?1049l");
     assert!(String::from_utf8_lossy(&output).contains("\x1b[?1006l"));
@@ -525,8 +514,8 @@ fn real_terminal_dashboard_copies_secrets_without_rendering_and_restores_screen(
     assert_eq!(requests.matches("token_create").count(), 1);
     assert_eq!(requests.matches("token_rotate").count(), 1);
     assert_eq!(requests.matches("token_revoke").count(), 1);
-    assert_eq!(requests.matches("reset_prepare").count(), 2);
-    assert_eq!(requests.matches("reset_confirm").count(), 1);
+    assert_eq!(requests.matches("reset_prepare").count(), 0);
+    assert_eq!(requests.matches("reset_confirm").count(), 0);
     assert!(!requests.contains("Test service"));
     assert!(requests.contains("exrp1:"));
     let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -868,27 +857,15 @@ fn dashboard_help_accepts_slash_and_russian_layout_punctuation() {
 }
 
 #[test]
-fn dashboard_reset_eligibility_error_requires_dismissal_and_never_confirms_a_credit() {
+fn dashboard_retired_reset_shortcut_never_sends_a_mutation() {
     let client = Client::configured();
-    let ssh = client.dir.path().join("ssh");
-    let original = fs::read_to_string(&ssh).unwrap();
-    let rewritten = original.lines().map(|line| {
-        if line.contains("action\":\"reset_prepare") {
-            "  *'\"action\":\"reset_prepare\"'*) printf '%s' '{\"ok\":false,\"error\":\"Reset credits require a live subscription window with 5% or less remaining and a known future reset time\"}' ;;"
-        } else {
-            line
-        }
-    }).collect::<Vec<_>>().join("\n");
-    fs::write(&ssh, rewritten).unwrap();
     let mut dashboard = Dashboard::start(client.command());
     dashboard.wait("test@example.com");
     dashboard.send(b"c");
-    dashboard.wait("Reset credit unavailable");
-    dashboard.wait("Close Esc");
-    dashboard.send(b"y\r\x1b[C\x1b[C\x1b[C");
+    dashboard.send(b"\x1b[C\x1b[C\x1b[C");
     dashboard.wait("Copy ID Enter");
     let requests = fs::read_to_string(client.dir.path().join("requests.log")).unwrap();
-    assert_eq!(requests.matches("\"action\":\"reset_prepare\"").count(), 1);
+    assert_eq!(requests.matches("\"action\":\"reset_prepare\"").count(), 0);
     assert!(!requests.contains("\"action\":\"reset_confirm\""));
     dashboard.quit();
 }
@@ -1242,7 +1219,7 @@ fn opencode_exports_reuse_saved_api_url_and_select_only_catalog_models() {
 }
 
 #[test]
-fn account_cli_serializes_numeric_rules_and_rejects_invalid_values_before_mutation() {
+fn account_cli_rejects_retired_rules_and_manual_redemption_before_mutation() {
     let client = Client::configured();
     let output = client.run(&[
         "account",
@@ -1258,23 +1235,8 @@ fn account_cli_serializes_numeric_rules_and_rejects_invalid_values_before_mutati
         "15",
         "--json",
     ]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let requests = fs::read_to_string(client.dir.path().join("requests.log")).unwrap();
-    let mutation: serde_json::Value = serde_json::from_str(
-        requests
-            .lines()
-            .find(|line| line.contains("account_set"))
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(mutation["routing"]["priority"], -255);
-    assert_eq!(mutation["routing"]["switch_at"], 20);
-    assert_eq!(mutation["routing"]["switch_at_short"], "off");
-    assert_eq!(mutation["routing"]["switch_at_weekly"], 15);
+    assert!(!output.status.success());
+    assert!(!client.run(&["limits", "reset", "1"]).status.success());
     for (flag, value) in [
         ("--priority", "256"),
         ("--switch-at", "101"),
@@ -1285,42 +1247,19 @@ fn account_cli_serializes_numeric_rules_and_rejects_invalid_values_before_mutati
             .status
             .success());
     }
-    assert_eq!(
-        fs::read_to_string(client.dir.path().join("requests.log")).unwrap(),
-        requests
-    );
+    assert!(!client.dir.path().join("requests.log").exists());
 }
 
 #[test]
-fn dashboard_edits_rules_validates_and_cancels_without_mutating() {
+fn dashboard_retired_routing_shortcuts_do_not_mutate() {
     let client = Client::configured();
     let mut dashboard = Dashboard::start(client.command());
-    dashboard.wait("Priority 1");
+    dashboard.wait("Automatic");
     std::thread::sleep(std::time::Duration::from_millis(200));
-    dashboard.send(b"S");
-    dashboard.wait("Switching rules");
-    dashboard.send(b"\x15256\r");
-    dashboard.wait("Priority must be between");
-    dashboard.send(b"\x1b");
-    dashboard.wait("Priority 1");
+    dashboard.send(b"SPc");
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()
         .contains("account_set"));
-    dashboard.send(b"S");
-    dashboard.wait("Switching rules");
-    dashboard.send(b"\x15-255\t\x1520\t\x15off\t\x1515\r");
-    dashboard.wait("Account preferences saved");
-    let requests = fs::read_to_string(client.dir.path().join("requests.log")).unwrap();
-    let mutations = requests
-        .lines()
-        .filter(|line| line.contains("account_set"))
-        .collect::<Vec<_>>();
-    assert_eq!(mutations.len(), 1);
-    let mutation: serde_json::Value = serde_json::from_str(mutations[0]).unwrap();
-    assert_eq!(mutation["routing"]["priority"], -255);
-    assert_eq!(mutation["routing"]["switch_at"], 20);
-    assert_eq!(mutation["routing"]["switch_at_short"], "off");
-    assert_eq!(mutation["routing"]["switch_at_weekly"], 15);
     dashboard.quit();
 }
 
@@ -1334,17 +1273,11 @@ fn unsupported_remote_rules_are_explained_without_sending_a_mutation() {
     fs::write(&path, script).unwrap();
     let output = client.run(&["account", "set", "1", "--switch-at", "20"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("updated server and SSH gateway"));
-    assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
-        .unwrap()
-        .contains("account_set"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     let mut dashboard = Dashboard::start(client.command());
-    dashboard.wait("Priority 1");
+    dashboard.wait("Automatic");
     std::thread::sleep(std::time::Duration::from_millis(200));
     dashboard.send(b"S");
-    dashboard.wait("Server update required");
-    dashboard.dismiss("Server update required");
-    dashboard.wait("Priority 1");
     dashboard.quit();
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()
@@ -1365,7 +1298,7 @@ fn unsupported_remote_rules_are_explained_without_sending_a_mutation() {
 }
 
 #[test]
-fn dashboard_locked_rules_remain_visible_and_cannot_be_saved() {
+fn dashboard_operator_activation_lock_cannot_be_bypassed() {
     let client = Client::configured();
     let path = client.dir.path().join("ssh");
     let script = fs::read_to_string(&path)
@@ -1373,12 +1306,11 @@ fn dashboard_locked_rules_remain_visible_and_cannot_be_saved() {
         .replace("\"locked\":false", "\"locked\":true");
     fs::write(&path, script).unwrap();
     let mut dashboard = Dashboard::start(client.command());
-    dashboard.wait("Priority 1");
+    dashboard.wait("Locked");
     std::thread::sleep(std::time::Duration::from_millis(200));
-    dashboard.send(b"S");
-    dashboard.wait("Locked by server operator");
-    dashboard.send(b"\x1520\r");
-    dashboard.wait("Priority 1");
+    dashboard.send(b"D");
+    dashboard.wait("Account settings locked");
+    dashboard.dismiss("Account settings locked");
     dashboard.quit();
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()

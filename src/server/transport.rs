@@ -2316,6 +2316,10 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                             || upstream
                                 .threshold_reached(identity.user_id, id)
                                 .await
+                                .unwrap_or(false)
+                            || upstream
+                                .routing_preempted(&model, identity.user_id, id)
+                                .await
                                 .unwrap_or(false))
                     {
                         if let Ok(account) = select_context_account(
@@ -2342,7 +2346,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                         .as_ref()
                                         .is_some_and(|history| history.expand(&mut payload))
                                 {
-                                    // A configured soft threshold must not interrupt an
+                                    // An automatic soft preference must not interrupt an
                                     // otherwise usable session without recovery history.
                                     if !upstream.quota_exhausted(id).await.unwrap_or(true) {
                                         break 'migration;

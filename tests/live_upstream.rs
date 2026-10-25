@@ -144,6 +144,7 @@ impl Session {
         drop(reservation);
         let (stop, stopped) = oneshot::channel();
         let config = server::ServeConfig {
+            account_maintenance: false,
             gateway_uid: unsafe { libc::geteuid() },
             listen: address,
             socket: directory.join("live-smoke.sock"),
@@ -218,6 +219,7 @@ impl Session {
         )?);
         let (stop, stopped) = oneshot::channel();
         let config = server::ServeConfig {
+            account_maintenance: false,
             gateway_uid: unsafe { libc::geteuid() },
             listen: self
                 .url

@@ -37,6 +37,7 @@ pub(crate) struct Sample {
 #[derive(Default)]
 pub(crate) struct Observation {
     windows: Vec<Sample>,
+    absent_windows: Vec<&'static str>,
     cooldown: Option<(i64, &'static str)>,
     live_allowed: bool,
 }
@@ -82,6 +83,13 @@ impl Observation {
         self
     }
 
+    /// Only an explicit null in a dedicated live usage payload proves absence;
+    /// missing inference headers/events never erase a historical window.
+    pub(crate) fn with_live_absent_windows(mut self, kinds: Vec<&'static str>) -> Self {
+        self.absent_windows = kinds;
+        self
+    }
+
     /// Forward only validated numeric general-meter metadata. Never proxy
     /// arbitrary header names/values or fabricate absent windows/credits.
     pub(crate) fn response_headers(&self) -> HeaderMap {
@@ -112,7 +120,7 @@ impl Observation {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.windows.is_empty() && self.cooldown.is_none()
+        self.windows.is_empty() && self.absent_windows.is_empty() && self.cooldown.is_none()
     }
     pub(crate) fn cooldown_until(&self) -> Option<i64> {
         self.cooldown.map(|(until, _)| until)
@@ -298,14 +306,22 @@ pub(crate) fn save(
     if !valid {
         return Ok(());
     }
-    if observation.live_allowed && observation.cooldown.is_none() {
+    if observation.live_allowed && observation.cooldown.is_none() && !observation.windows.is_empty()
+    {
         // The order was allocated before the GET. Any subsequently saved
         // rejection for this account invalidates this conservative fence.
         // This also covers rejections without windows and identical deadlines.
         tx.execute("UPDATE oauth_accounts SET cooldown_until=NULL,cooldown_source=NULL WHERE id=?1 AND cooldown_source='upstream_reset' AND cooldown_order<?2 AND NOT EXISTS(SELECT 1 FROM oauth_quota_windows WHERE account_id=?1 AND request_order>?2)",params![account,order])?;
     }
+    for kind in observation.absent_windows {
+        tx.execute("INSERT INTO oauth_quota_absences(account_id,kind,request_order) VALUES(?1,?2,?3) ON CONFLICT(account_id,kind) DO UPDATE SET request_order=excluded.request_order WHERE excluded.request_order>oauth_quota_absences.request_order", params![account,kind,order])?;
+        tx.execute(
+            "DELETE FROM oauth_quota_windows WHERE account_id=?1 AND kind=?2 AND request_order<=?3",
+            params![account, kind, order],
+        )?;
+    }
     for window in observation.windows {
-        tx.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(?1,?2,?3,?4,?5,?6,?7)
+        tx.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(SELECT 1 FROM oauth_quota_absences WHERE account_id=?1 AND kind=?2 AND request_order>=?7)
             ON CONFLICT(account_id,kind) DO UPDATE SET used_percent=excluded.used_percent,window_minutes=excluded.window_minutes,reset_at=excluded.reset_at,observed_at=excluded.observed_at,request_order=excluded.request_order
             WHERE excluded.request_order >= oauth_quota_windows.request_order",
             params![account,window.kind,window.used,window.minutes,window.reset,now,order])?;
@@ -387,6 +403,32 @@ pub fn summary(conn: &Connection, account: i64, now: i64) -> Result<Summary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_absence_erases_only_older_windows_and_alone_cannot_clear_cooldown() {
+        let mut conn = database();
+        put(&mut conn, 10, rate(50.0, 2000));
+        let absent = || {
+            Observation::default()
+                .with_live_allowed(true)
+                .with_live_absent_windows(vec!["primary"])
+        };
+        save(&mut conn, 1, 0, 9, absent(), 1001).unwrap();
+        assert_eq!(summary(&conn, 1, 1001).unwrap().windows.len(), 1);
+        conn.execute("UPDATE oauth_accounts SET cooldown_until=2000,cooldown_source='upstream_reset' WHERE id=1",[]).unwrap();
+        save(&mut conn, 1, 0, 11, absent(), 1002).unwrap();
+        let report = summary(&conn, 1, 1002).unwrap();
+        assert!(report.windows.is_empty());
+        assert_eq!(report.cooldown_until, Some(2000));
+        // The absence fence survives a late event and a database reopen/init.
+        crate::store::init(&conn).unwrap();
+        put(&mut conn, 10, rate(100.0, 2000));
+        assert!(summary(&conn, 1, 1003).unwrap().windows.is_empty());
+        put(&mut conn, 12, rate(25.0, 2000));
+        assert_eq!(
+            summary(&conn, 1, 1003).unwrap().windows[0].used_percent,
+            25.0
+        );
+    }
     use serde_json::json;
 
     fn database() -> Connection {

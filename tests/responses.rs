@@ -216,6 +216,7 @@ impl Fixture {
         let (stop, stopped) = oneshot::channel();
         let serve_db = db.clone();
         let config = ServeConfig {
+            account_maintenance: false,
             gateway_uid: unsafe { libc::geteuid() },
             listen: address,
             socket: dir.path().join("control.sock"),
@@ -294,6 +295,7 @@ impl Fixture {
         let (stop, stopped) = oneshot::channel();
         self.stop = Some(stop);
         let config = ServeConfig {
+            account_maintenance: false,
             gateway_uid: unsafe { libc::geteuid() },
             listen: self.url.strip_prefix("http://").unwrap().parse().unwrap(),
             socket: self.dir.path().join("control.sock"),
@@ -3251,7 +3253,7 @@ async fn pool_compaction_routes_http_and_new_ws_to_its_account_after_restart() {
     let checkpoint = reply.json::<Value>().await.unwrap()["output"].clone();
     fixture.db.call(|conn| {
         let now=chrono::Utc::now().timestamp();
-        conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,observed_at,request_order) VALUES(1,'primary',0,?1,0),(2,'primary',99,?1,0)",[now])?;
+        conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,observed_at,request_order) VALUES(1,'primary',0,?1,0),(2,'primary',98,?1,0)",[now])?;
         Ok(())
     }).await.unwrap();
     fixture.restart().await;
@@ -3733,7 +3735,7 @@ async fn pinned_ws_rejects_context_from_another_account_without_moving_its_histo
 
 #[tokio::test]
 async fn transferred_ws_discards_retired_turn_state_before_checking_full_context() {
-    for used in [80., 100.] {
+    for used in [99., 100.] {
         let fixture = Fixture::start(false).await;
         fixture.add_account(&["gpt-test"], false).await;
         *fixture.mock.mode.lock().unwrap() = "turn_state".into();
@@ -3775,6 +3777,8 @@ async fn transferred_ws_discards_retired_turn_state_before_checking_full_context
         // the router has moved that turn to a replacement account.
         body["client_metadata"] = json!({"x-codex-turn-state":turn_state});
         configure_soft_threshold(&fixture, 1, used, 0).await;
+        configure_soft_threshold(&fixture, 2, 10., 0).await;
+        observe_expiring_reset(&fixture, 2).await;
         socket
             .send(Message::Text(body.to_string().into()))
             .await
@@ -4236,7 +4240,7 @@ async fn pool_ws_keeps_affinity_until_quota_then_recovers_on_another_account() {
     fixture.add_account(&["gpt-test"], false).await;
     fixture.db.call(|conn| {
         let now=chrono::Utc::now().timestamp();
-        conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(1,'primary',70,300,?1,?2,0),(2,'primary',20,300,?1,?2,0)",rusqlite::params![now+300,now])?;
+        conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(1,'primary',20,300,?1,?2,0),(2,'primary',70,300,?1,?2,0)",rusqlite::params![now+300,now])?;
         Ok(())
     }).await.unwrap();
     let mut socket = fixture.ws().await;
@@ -4252,7 +4256,7 @@ async fn pool_ws_keeps_affinity_until_quota_then_recovers_on_another_account() {
         ["upstream-account-2"]
     );
     fixture.db.call(|conn| {
-        conn.execute("UPDATE oauth_quota_windows SET used_percent=CASE account_id WHEN 1 THEN 0 ELSE 99 END",[])?;
+        conn.execute("UPDATE oauth_quota_windows SET used_percent=CASE account_id WHEN 1 THEN 0 ELSE 98 END",[])?;
         Ok(())
     }).await.unwrap();
     body["previous_response_id"] = previous;
@@ -5664,6 +5668,7 @@ async fn account_preferences_route_by_user_and_operator_deactivation_blocks_boun
     let fixture = Fixture::start(false).await;
     let second = fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
+    observe_expiring_reset(&fixture, second).await;
     fixture
         .db
         .call(move |conn| {
@@ -5674,7 +5679,7 @@ async fn account_preferences_route_by_user_and_operator_deactivation_blocks_boun
                 exetrouter::ControlRequest::AccountSet {
                     account: second,
                     enabled: Some(true),
-                    priority: Some(10),
+                    priority: None,
                     routing: None,
                 },
             )?;
@@ -6585,21 +6590,113 @@ async fn saved_conversations_are_user_owned_pinned_and_never_migrate_on_quota() 
 
 async fn configure_soft_threshold(fixture: &Fixture, account: i64, used: f64, age: i64) {
     fixture.db.call(move |conn| {
-        use exetrouter::account_preferences::{set_user_rules, RoutingArgs, Setting};
-        set_user_rules(conn,1,account,None,None,&RoutingArgs { priority:Some(Setting::Number(if account == 1 { 10 } else { 1 })),switch_at:Some(Setting::Number(20)),..Default::default() })?;
         let now=chrono::Utc::now().timestamp();
+        conn.execute("INSERT INTO account_routing_metadata(account_id,generation,request_order,observed_at,short_window) SELECT id,generation,0,?2,?3 FROM oauth_accounts WHERE id=?1 ON CONFLICT(account_id) DO UPDATE SET observed_at=excluded.observed_at,short_window=excluded.short_window",rusqlite::params![account,now,account==1])?;
         conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(?1,'primary',?2,300,?3,?4,0) ON CONFLICT(account_id,kind) DO UPDATE SET used_percent=excluded.used_percent,reset_at=excluded.reset_at,observed_at=excluded.observed_at",rusqlite::params![account,used,now+300,now-age])?;
         Ok(())
     }).await.unwrap();
 }
 
+async fn observe_expiring_reset(fixture: &Fixture, account: i64) {
+    fixture.db.call(move|conn|{
+        let now=chrono::Utc::now().timestamp();
+        let credits=json!({"available_count":1,"credits":[{"title":"Full reset","expires_at":now+2*86400}],"details_available":true,"observed_at":now});
+        conn.execute("INSERT INTO account_routing_metadata(account_id,generation,request_order,observed_at,short_window,credits) SELECT id,generation,0,?2,0,?3 FROM oauth_accounts WHERE id=?1 ON CONFLICT(account_id) DO UPDATE SET observed_at=excluded.observed_at,credits=excluded.credits",rusqlite::params![account,now,credits.to_string()])?;
+        Ok(())
+    }).await.unwrap();
+}
+
+async fn expire_alternative_catalog(fixture: &Fixture) {
+    fixture
+        .db
+        .call(|conn| {
+            conn.execute(
+                "UPDATE oauth_accounts SET catalog_updated_at=?1 WHERE id=2",
+                [chrono::Utc::now().timestamp() - 61],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
-async fn soft_threshold_prefers_alternatives_but_falls_back_and_ignores_stale_data() {
+async fn urgent_expiring_reset_preempts_http_checkpoint_and_bound_ws_without_losing_context() {
+    for websocket in [false, true] {
+        let fixture = Fixture::start(false).await;
+        fixture.add_account(&["gpt-test"], false).await;
+        fixture.upstream.models().await.unwrap();
+        configure_soft_threshold(&fixture, 1, 10., 0).await;
+        configure_soft_threshold(&fixture, 2, 10., 0).await;
+        if websocket {
+            let mut socket = fixture.ws().await;
+            let mut body = request();
+            body["type"] = json!("response.create");
+            socket
+                .send(Message::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            let first = terminal(&mut socket).await;
+            observe_expiring_reset(&fixture, 2).await;
+            expire_alternative_catalog(&fixture).await;
+            body["previous_response_id"] = first["response"]["id"].clone();
+            body["input"] = json!([{"role":"user","content":"synthetic next"}]);
+            socket
+                .send(Message::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+            socket.close(None).await.unwrap();
+            let requests = fixture.mock.requests.lock().unwrap();
+            assert!(requests[1].get("previous_response_id").is_none());
+            assert!(requests[1]["input"].as_array().unwrap().len() > 1);
+        } else {
+            let checkpoint = fixture
+                .compact(
+                    json!({"model":"gpt-test","input":[{"role":"user","content":"synthetic"}]}),
+                )
+                .await
+                .json::<Value>()
+                .await
+                .unwrap()["output"][0]
+                .clone();
+            observe_expiring_reset(&fixture, 2).await;
+            expire_alternative_catalog(&fixture).await;
+            let mut body = request();
+            body["stream"] = json!(false);
+            body["input"] = json!([checkpoint,{"role":"user","content":"synthetic next"}]);
+            assert_eq!(fixture.post(body).await.status(), 200);
+        }
+        if websocket {
+            assert_eq!(
+                *fixture.mock.request_accounts.lock().unwrap(),
+                ["upstream-account", "upstream-account-2"]
+            );
+        } else {
+            assert_eq!(
+                fixture.mock.compactions.lock().unwrap()[0].0,
+                "upstream-account"
+            );
+            assert_eq!(
+                *fixture.mock.request_accounts.lock().unwrap(),
+                ["upstream-account-2"]
+            );
+        }
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn ordinary_routing_uses_the_last_percent_and_ignores_stale_exhaustion() {
     for (used, age, second_used, expected) in [
-        (79.9, 0, 10., "upstream-account"),
-        (80., 0, 10., "upstream-account-2"),
-        (90., 0, 85., "upstream-account"),
-        (90., 60, 10., "upstream-account"),
+        (98.9, 0, 10., "upstream-account"),
+        (99., 0, 10., "upstream-account"),
+        (99.999, 0, 10., "upstream-account"),
+        (100., 0, 99.5, "upstream-account-2"),
+        (100., 0, 100., "upstream-account"),
+        (99.5, 0, 99.25, "upstream-account"),
+        (99.5, 60, 10., "upstream-account"),
+        (100., 60, 10., "upstream-account"),
     ] {
         let fixture = Fixture::start(false).await;
         fixture.add_account(&["gpt-test"], false).await;
@@ -6618,12 +6715,71 @@ async fn soft_threshold_prefers_alternatives_but_falls_back_and_ignores_stale_da
 }
 
 #[tokio::test]
-async fn soft_threshold_is_shared_by_chat_and_compact_and_respects_deactivation() {
+async fn restored_short_window_reclaims_http_and_ws_sessions_from_weekly_reserve() {
+    for websocket in [false, true] {
+        let fixture = Fixture::start(false).await;
+        fixture.add_account(&["gpt-test"], false).await;
+        fixture.upstream.models().await.unwrap();
+        configure_soft_threshold(&fixture, 1, 100., 0).await;
+        configure_soft_threshold(&fixture, 2, 20., 0).await;
+        if websocket {
+            let mut socket = fixture.ws().await;
+            let mut body = request();
+            body["type"] = json!("response.create");
+            socket
+                .send(Message::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            let first = terminal(&mut socket).await;
+            configure_soft_threshold(&fixture, 1, 0., 0).await;
+            body["previous_response_id"] = first["response"]["id"].clone();
+            body["input"] = json!([{"role":"user","content":"synthetic continuation"}]);
+            socket
+                .send(Message::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+            socket.close(None).await.unwrap();
+            assert_eq!(
+                *fixture.mock.request_accounts.lock().unwrap(),
+                ["upstream-account-2", "upstream-account"]
+            );
+        } else {
+            let checkpoint = fixture
+                .compact(
+                    json!({"model":"gpt-test","input":[{"role":"user","content":"synthetic"}]}),
+                )
+                .await
+                .json::<Value>()
+                .await
+                .unwrap()["output"][0]
+                .clone();
+            assert_eq!(
+                fixture.mock.compactions.lock().unwrap()[0].0,
+                "upstream-account-2"
+            );
+            configure_soft_threshold(&fixture, 1, 0., 0).await;
+            let mut body = request();
+            body["stream"] = json!(false);
+            body["input"] = json!([checkpoint,{"role":"user","content":"synthetic continuation"}]);
+            assert_eq!(fixture.post(body).await.status(), 200);
+            assert_eq!(
+                *fixture.mock.request_accounts.lock().unwrap(),
+                ["upstream-account"]
+            );
+        }
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn urgency_is_shared_by_chat_and_compact_and_respects_deactivation() {
     let fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
-    configure_soft_threshold(&fixture, 1, 85., 0).await;
+    configure_soft_threshold(&fixture, 1, 99.5, 0).await;
     configure_soft_threshold(&fixture, 2, 10., 0).await;
+    observe_expiring_reset(&fixture, 2).await;
     assert_eq!(
         fixture
             .chat(json!({"model":"gpt-test","messages":[{"role":"user","content":"synthetic"}]}))
@@ -6668,7 +6824,7 @@ async fn soft_threshold_is_shared_by_chat_and_compact_and_respects_deactivation(
 }
 
 #[tokio::test]
-async fn soft_threshold_migrates_checkpoint_forks_without_replaying_or_losing_ownership() {
+async fn urgency_migrates_checkpoint_forks_without_replaying_or_losing_ownership() {
     let mut fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
@@ -6680,7 +6836,9 @@ async fn soft_threshold_migrates_checkpoint_forks_without_replaying_or_losing_ow
         .await
         .unwrap()["output"][0]
         .clone();
-    configure_soft_threshold(&fixture, 1, 80., 0).await;
+    configure_soft_threshold(&fixture, 1, 99., 0).await;
+    configure_soft_threshold(&fixture, 2, 10., 0).await;
+    observe_expiring_reset(&fixture, 2).await;
     let mut body = request();
     body["stream"] = json!(false);
     body["test_mode"] = json!("native_proofs");
@@ -6746,7 +6904,7 @@ async fn soft_threshold_migrates_checkpoint_forks_without_replaying_or_losing_ow
 }
 
 #[tokio::test]
-async fn soft_threshold_ws_recovers_complete_context_and_keeps_downstream_socket() {
+async fn urgency_ws_recovers_complete_context_and_keeps_downstream_socket() {
     let fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
@@ -6760,7 +6918,9 @@ async fn soft_threshold_ws_recovers_complete_context_and_keeps_downstream_socket
         .unwrap();
     let first = terminal(&mut socket).await;
     assert_eq!(first["type"], "response.completed");
-    configure_soft_threshold(&fixture, 1, 80., 0).await;
+    configure_soft_threshold(&fixture, 1, 99., 0).await;
+    configure_soft_threshold(&fixture, 2, 10., 0).await;
+    observe_expiring_reset(&fixture, 2).await;
     body["previous_response_id"] = first["response"]["id"].clone();
     body["input"] = json!([{"role":"user","content":"synthetic next"}]);
     socket
@@ -6785,7 +6945,7 @@ async fn soft_threshold_ws_recovers_complete_context_and_keeps_downstream_socket
 }
 
 #[tokio::test]
-async fn soft_threshold_without_recoverable_ws_history_stays_on_original_account() {
+async fn urgency_without_recoverable_ws_history_stays_on_original_account() {
     let fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
@@ -6803,7 +6963,9 @@ async fn soft_threshold_without_recoverable_ws_history_stays_on_original_account
         .await
         .unwrap();
     assert_eq!(terminal(&mut socket).await["type"], "response.completed");
-    configure_soft_threshold(&fixture, 1, 80., 0).await;
+    configure_soft_threshold(&fixture, 1, 99., 0).await;
+    configure_soft_threshold(&fixture, 2, 10., 0).await;
+    observe_expiring_reset(&fixture, 2).await;
     // The most recent recovery window cannot expand an earlier branch.
     body["previous_response_id"] = first["response"]["id"].clone();
     body["input"] = json!([{"role":"user","content":"synthetic older branch"}]);
@@ -6824,7 +6986,7 @@ async fn soft_threshold_without_recoverable_ws_history_stays_on_original_account
 }
 
 #[tokio::test]
-async fn soft_threshold_failed_replacement_handshake_restores_original_incremental_request() {
+async fn urgency_failed_replacement_handshake_restores_original_incremental_request() {
     let fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
@@ -6837,7 +6999,9 @@ async fn soft_threshold_failed_replacement_handshake_restores_original_increment
         .await
         .unwrap();
     let first = terminal(&mut socket).await;
-    configure_soft_threshold(&fixture, 1, 80., 0).await;
+    configure_soft_threshold(&fixture, 1, 99., 0).await;
+    configure_soft_threshold(&fixture, 2, 10., 0).await;
+    observe_expiring_reset(&fixture, 2).await;
     fixture
         .mock
         .handshake_rate_limit
@@ -6862,7 +7026,7 @@ async fn soft_threshold_failed_replacement_handshake_restores_original_increment
 }
 
 #[tokio::test]
-async fn hard_quota_can_use_an_alternative_below_its_soft_threshold() {
+async fn hard_quota_can_use_an_alternative_with_less_than_one_percent() {
     let fixture = Fixture::start(false).await;
     fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
@@ -6875,7 +7039,7 @@ async fn hard_quota_can_use_an_alternative_below_its_soft_threshold() {
         .unwrap()["output"][0]
         .clone();
     configure_soft_threshold(&fixture, 1, 100., 0).await;
-    configure_soft_threshold(&fixture, 2, 85., 0).await;
+    configure_soft_threshold(&fixture, 2, 99.5, 0).await;
     let mut body = request();
     body["stream"] = json!(false);
     body["input"] = json!([checkpoint,{"role":"user","content":"synthetic next"}]);

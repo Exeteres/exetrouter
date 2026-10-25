@@ -39,6 +39,9 @@ pub use limits::Snapshot as LimitSnapshot;
 mod transport;
 
 pub struct ServeConfig {
+    /// Production runtimes enable maintenance; isolated protocol fixtures can
+    /// drive metadata/reset ticks explicitly without background OAuth races.
+    pub account_maintenance: bool,
     pub gateway_uid: u32,
     pub listen: SocketAddr,
     pub socket: PathBuf,
@@ -194,6 +197,17 @@ pub async fn serve(
         tracing::warn!(event = "requests_recovered", count = recovered);
     }
     let mut tasks = JoinSet::new();
+    if let Some(upstream) = state
+        .upstream
+        .clone()
+        .filter(|_| config.account_maintenance)
+    {
+        let worker_stop = stopped.clone();
+        tasks.spawn(async move {
+            upstream.automatic_accounts(worker_stop).await;
+            Ok(())
+        });
+    }
     let http_stop = stopped.clone();
     let app = router(state.clone());
     tasks.spawn(async move {
@@ -269,7 +283,7 @@ pub(crate) async fn local_api(
         continuation_bytes: Arc::new(Semaphore::new(continuation::TOTAL_BYTES)),
         generation_slots: limits::Slots::new(8),
         websocket_slots: limits::Slots::new(8),
-        upstream: Some(upstream),
+        upstream: Some(upstream.clone()),
         jobs: jobs.clone(),
         stopped: stopped.clone(),
     });
@@ -281,18 +295,35 @@ pub(crate) async fn local_api(
     let status = LocalStatus(state.clone());
     let (shutdown, signal) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
+        let worker_stop = stopped.clone();
+        let mut worker =
+            tokio::spawn(async move { upstream.automatic_accounts(worker_stop).await });
         let app = router(state);
         let serving = std::future::IntoFuture::into_future(
             axum::serve(listener, app).with_graceful_shutdown(wait_for_stop(stopped)),
         );
         tokio::pin!(serving);
-        let result = tokio::select! {
-            result = &mut serving => result,
+        let result: Result<()> = tokio::select! {
+            result = &mut serving => result.map_err(Into::into),
             _ = signal => {
                 let _=stop.send(true);
-                tokio::time::timeout(SHUTDOWN_TIMEOUT,&mut serving).await.map_err(|_|"Standalone shutdown timed out")?
+                match tokio::time::timeout(SHUTDOWN_TIMEOUT,&mut serving).await {
+                    Ok(result)=>result.map_err(Into::into),
+                    Err(_)=>Err("Standalone shutdown timed out".into()),
+                }
             }
         };
+        let _ = stop.send(true);
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut worker).await {
+            Ok(result) => result?,
+            Err(_) => {
+                // A persisted submitted claim makes an interrupted POST uncertain,
+                // never retryable. Do not leave a detached maintenance task alive.
+                worker.abort();
+                let _ = worker.await;
+                return Err("Standalone account maintenance shutdown timed out".into());
+            }
+        }
         result?;
         jobs.close();
         tokio::time::timeout(SHUTDOWN_TIMEOUT, jobs.wait())
@@ -416,7 +447,6 @@ async fn process_control(
     // Parser messages can contain request data; never return or log them.
     let frame: GatewayMessage = serde_json::from_slice(&input)
         .map_err(|_| invalid("invalid_request", "invalid control request"))?;
-    let identity = frame.identity.clone();
     let key = state.key.clone();
     let models = matches!(frame.request, ControlRequest::Models);
     let doctor = matches!(
@@ -424,23 +454,18 @@ async fn process_control(
         ControlRequest::Doctor | ControlRequest::Limits
     );
     let live_limits = matches!(frame.request, ControlRequest::Limits);
-    let reset = matches!(
-        frame.request,
-        ControlRequest::ResetPrepare { .. } | ControlRequest::ResetConfirm { .. }
-    );
-    let (user_id, result, request) = state
+    let (user_id, result) = state
         .db
         .call(move |conn| {
             let user_id = resolve_ssh_identity(conn, &frame.identity)?
                 .ok_or("SSH identity revoked or unknown")?;
             Ok((
                 user_id,
-                if doctor || reset {
+                if doctor {
                     Value::Null
                 } else {
                     control(conn, &key, user_id, frame.request.clone())?
                 },
-                frame.request,
             ))
         })
         .await
@@ -448,24 +473,6 @@ async fn process_control(
             code: "control_failed",
             message: err.to_string(),
         })?;
-    if reset {
-        let upstream = state
-            .upstream
-            .as_ref()
-            .ok_or_else(|| invalid("upstream_unavailable", "OAuth upstream unavailable"))?;
-        return match request {
-            ControlRequest::ResetPrepare { account } => {
-                upstream.prepare_reset(user_id, account).await
-            }
-            ControlRequest::ResetConfirm { confirmation } => {
-                upstream
-                    .confirm_reset(user_id, &confirmation, &identity)
-                    .await
-            }
-            _ => unreachable!(),
-        }
-        .map_err(|err| invalid("reset_failed", &err.to_string()));
-    }
     if doctor {
         let configured = state.upstream.is_some();
         let limits = crate::doctor::LimitsReport {

@@ -18,14 +18,14 @@ exr account add
 exr account reauth ID
 exr account disable ID --yes
 exr account enable ID
-exr account set ID --priority 10 --switch-at 20
-exr account set ID --switch-at-short off --switch-at-weekly 15
+exr account set ID --enabled false
+exr account enable ID
 exr serve
 ```
 
 Standalone data defaults to `$XDG_DATA_HOME/exr` (`~/.local/share/exr`), private mode 0700. `--state-dir PATH` and `--listen 127.0.0.1:PORT` override it. The API runs while the TUI or foreground `exr serve` remains open. Issue a local bearer in Tokens, then use the local `/v1` endpoint in your client. No user/SSH administration is exposed in standalone; the internal owner scope keeps token/usage/affinity semantics consistent.
 
-OAuth add/reauth requires the owner's interactive terminal or TUI Settings browser flow. Never capture real tokens. Enter opens Overview account actions (reset-credit review, numeric priority, switching rules, deactivate/reactivate for the current user), Tokens actions and Settings actions. Account preferences work in remote and standalone modes; operator locks are enforced remotely and cannot be bypassed by CLI or TUI. Deactivation retains OAuth data and can be reversed without login. Priority is -255…255 (default 1), with larger numbers preferred within a threshold tier; existing saved numbers are retained. Thresholds are whole percentages 0…100, `off` or `default` to inherit operator settings. In Overview, P edits priority and S edits all routing rules; Enter saves, Esc cancels. Soft thresholds move owned sessions only with recoverable full context and a suitable alternative; otherwise the healthy original account continues. Inspect effective settings and threshold status in Overview/limits. New rules require matching updated server and SSH gateway support; schema 8 to 9 needs the reviewed migration in `docs/account-routing-migration.md`. Settings supports account selection, add and reauthorize; real reset credits still require separate confirmation. Operator/server tasks belong to the separate `$exrd` skill.
+OAuth add/reauth requires the owner's interactive terminal or TUI Settings browser flow. Never capture real tokens. Enter opens Overview activation/personal-label actions, Tokens actions and Settings actions. Operator activation locks are enforced remotely; deactivation retains OAuth state. Routing and expiring-reset redemption are automatic, with reasons/outcomes in Overview and Limits; there are no manual priority, switching-rule or redemption controls. Short-window subscriptions are used before weekly-only reserves, except urgent reset-expiry/weekly-refresh deadlines within 72 hours. Soft transfers require full recoverable context. Settings supports account selection, add and reauthorize. Operator/server tasks belong to `$exrd`; schema 12 needs the reviewed migration in `docs/automatic-routing-migration.md`.
 
 ## Connection and inspection
 
@@ -63,9 +63,9 @@ Read [references/connections.md](references/connections.md) when connecting Code
 
 ## Reset credits
 
-`exr limits --json` inspects availability without consuming a credit. `exr limits reset <email>` requires an interactive terminal and mandatory human confirmation; there is no `--yes` or JSON bypass. In Overview, select an account with ↑/↓, press Enter and choose Review reset credit (or use `c`); `y` confirms. Never drive confirmation or consume a real credit without the user's explicit approval for that account and credit.
+`exr limits --json` inspects availability; it does not itself redeem credits. The running API consumes an expiring credit at <72 hours to expiry and ≤1% weekly remaining, or one final-day salvage for the already-expiring cohort with consumed ordinary quota. Further credits wait for new weekly depletion after recovery. Strategic resets are preserved and do not affect priority; other subscriptions need not be empty. Ordinary routing uses quota through exhaustion. Manual redemption was removed.
 
-A current subscription window must have ≤5% remaining (≥95% used), with a known future reset. If the free reset is less than three days away, advise waiting as the confirmation does. The server selects the earliest-expiring available supported credit and rechecks usage before consumption. Confirmations expire after two minutes, are user-bound and single-use. Never retry an uncertain reset mutation automatically; read limits first and report the outcome.
+A randomized delay and fresh preflight precede a durable submission with an explicit credit and an account/weekly-cycle idempotency key shared across hosts. Every potentially successful reset fences further credits until verified recovery and a changed weekly cycle. Unknown outcomes are never replayed; confirmed no-ops require new consumption before reconsideration. Cohort/inventory guards survive restart. Missing/expired/stale data cannot authorize redemption. Never spend a real credit deliberately for testing; starting the runtime enables its documented automatic behavior.
 
 ## Software updates
 

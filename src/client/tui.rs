@@ -68,13 +68,7 @@ fn shortcut_key(mut key: KeyEvent) -> KeyEvent {
 fn command_input(state: &State) -> bool {
     !matches!(
         state.modal,
-        Some(
-            Modal::Name(_)
-                | Modal::Rename { .. }
-                | Modal::Days { .. }
-                | Modal::Personal { .. }
-                | Modal::Routing { locked: false, .. }
-        )
+        Some(Modal::Name(_) | Modal::Rename { .. } | Modal::Days { .. } | Modal::Personal { .. })
     )
 }
 
@@ -158,7 +152,6 @@ enum MouseAction {
     Tab(usize),
     Select(usize),
     Menu(usize),
-    Field(usize),
     Cursor,
 }
 #[derive(Clone, Copy, Debug)]
@@ -215,23 +208,6 @@ fn mouse_key(mouse: MouseEvent, hits: &[Hit], state: &mut State) -> Option<KeyEv
                         *selected = index;
                     }
                     KeyCode::Enter
-                }
-                MouseAction::Field(index) => {
-                    if let Some(Modal::Routing {
-                        selected, fields, ..
-                    }) = &mut state.modal
-                    {
-                        *selected = index;
-                        let labels = [
-                            "Priority (-255..255 / default)",
-                            "All windows (0..100 / off / default)",
-                            "Short window (0..100 / off / default)",
-                            "Weekly window (0..100 / off / default)",
-                        ];
-                        let start = hit.area.x + labels[index].len() as u16 + 4;
-                        fields[index].place_cursor(mouse.column.saturating_sub(start) as usize);
-                    }
-                    return None;
                 }
                 MouseAction::Cursor => {
                     if let Some(Modal::Personal { input, .. } | Modal::Rename { input, .. }) =
@@ -309,14 +285,6 @@ enum Modal {
         title: &'static str,
         message: String,
     },
-    Routing {
-        account: i64,
-        fields: Vec<TextInput>,
-        selected: usize,
-        error: String,
-        summary: String,
-        locked: bool,
-    },
     UpdateConfirm,
     Name(String),
     Rename {
@@ -341,7 +309,6 @@ enum Modal {
         secret: String,
         clipboard: Clipboard,
     },
-    ResetConfirm(Value),
     Help,
 }
 struct UpdateJob {
@@ -405,8 +372,6 @@ struct Pending {
     task: tokio::task::JoinHandle<Result<Value>>,
     tab: usize,
     mutation: bool,
-    reset_prepare: bool,
-    reset_confirm: bool,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
@@ -431,11 +396,7 @@ fn start(connection: &Connection, req: ControlRequest, tab: usize, mutation: boo
         json: false,
         command: super::CommandLine::Doctor,
     };
-    let reset_prepare = matches!(req, ControlRequest::ResetPrepare { .. });
-    let reset_confirm = matches!(req, ControlRequest::ResetConfirm { .. });
     Pending {
-        reset_prepare,
-        reset_confirm,
         task: tokio::spawn(async move {
             if tab == SETTINGS && !mutation {
                 let accounts = if session.connection.local.is_some() {
@@ -803,11 +764,7 @@ fn action_menu(state: &State, _connection: &Connection) -> (String, Vec<(String,
             else {
                 return ("Account unavailable".into(), vec![]);
             };
-            let mut entries = if row["preference"]["enabled"].as_bool() == Some(false) {
-                vec![]
-            } else {
-                vec![("Review reset credit".into(), KeyCode::Char('c'))]
-            };
+            let mut entries = vec![];
             if row["preference"]["locked"].as_bool() != Some(true) {
                 entries.push((
                     if row["preference"]["enabled"].as_bool() == Some(false) {
@@ -819,7 +776,6 @@ fn action_menu(state: &State, _connection: &Connection) -> (String, Vec<(String,
                     KeyCode::Char('D'),
                 ));
             }
-            entries.push(("Switching rules".into(), KeyCode::Char('S')));
             entries.push(("Edit personal account label".into(), KeyCode::Char('L')));
             return (
                 format!(
@@ -863,14 +819,6 @@ fn action_menu(state: &State, _connection: &Connection) -> (String, Vec<(String,
         .into(),
         entries,
     )
-}
-fn selected_reset_request(state: &State) -> Option<ControlRequest> {
-    state.values[OVERVIEW]
-        .as_ref()
-        .and_then(|value| value["quota_accounts"].as_array())
-        .and_then(|rows| rows.get(state.account_selected))
-        .and_then(|account| account["id"].as_i64())
-        .map(|account| ControlRequest::ResetPrepare { account })
 }
 fn token_rename_modal(state: &State) -> Option<Modal> {
     let row = state.values[TOKENS]
@@ -1201,7 +1149,6 @@ fn render_hits(
     if let Some(modal) = &state.modal {
         footer = vec![match modal {
             Modal::Actions { .. } => keys(&[("↑ / ↓", "select")]),
-            Modal::Routing { locked: false, .. } => keys(&[("Tab / ↑ / ↓", "field")]),
             Modal::Personal { .. } | Modal::Rename { .. } => {
                 keys(&[("← / →", "cursor"), ("Ctrl-U", "clear")])
             }
@@ -1320,11 +1267,6 @@ fn render_hits(
         let (title,text) = match modal {
             Modal::Actions { title, entries, selected } => (title.as_str(), entries.iter().enumerate().map(|(i,(name,key))|format!("{}{} {}",if i==*selected {"▶ "}else{"  "},name,shortcut_label(*key))).collect::<Vec<_>>().join("\n")),
             Modal::Error { title, message } => (*title, message.clone()),
-            Modal::Routing { fields, selected, error, summary, locked, .. } => {
-                let labels = ["Priority (-255..255 / default)", "All windows (0..100 / off / default)", "Short window (0..100 / off / default)", "Weekly window (0..100 / off / default)"];
-                let form = labels.iter().zip(fields).enumerate().map(|(i,(label,field))|format!("{}{}: {}",if i == *selected { "▶ " } else { "  " },label,field.value)).collect::<Vec<_>>().join("\n");
-                ("Switching rules", if *locked { format!("{summary}\n\nLocked by server operator") } else { format!("{form}\n\n{summary}\n\nDefault inherits operator settings. Thresholds are soft.\n{error}") })
-            },
             Modal::UpdateConfirm => ("Update exr", "Install the latest published release in the existing installation?\nThe installation method is preserved; config, accounts and tokens stay in place.\nSource builds may take several minutes. Restart exr after completion.".into()),
             Modal::Name(text) => ("Create token",format!("Token name: {text}")),
             Modal::Rename { input, error, .. } => ("Rename token", format!("{}\n\n{error}", input.value)),
@@ -1332,7 +1274,6 @@ fn render_hits(
             Modal::Days { name,text } => ("Create token",format!("Name: {name}\nExpires in days (1–365): {text}")),
             Modal::Confirm { id,rotate } => (if *rotate {"Rotate token"}else{"Revoke token"}, format!("Token: {id}\n{}",if *rotate {"The old secret will stop working. The new secret will be copied to the clipboard."}else{"This token will stop working immediately."})),
             Modal::ClipboardRetry { .. } => ("Clipboard unavailable", "The token was issued, but copying failed.\nThe secret stays hidden. No token request will be repeated.\nDiscarding it requires rotating the token later.".into()),
-            Modal::ResetConfirm(value) => ("Use reset credit?",render::reset_confirmation(value)),
             Modal::Help => ("Keyboard help", keyboard_help(state, connection)),
         };
         let mut area = popup(frame.area());
@@ -1343,10 +1284,6 @@ fn render_hits(
             .clamp(6, usize::from(area.height));
         area.height = needed as u16;
         area.y = frame.area().y + (frame.area().height - area.height) / 2;
-        if matches!(modal, Modal::Routing { .. }) {
-            area.height = area.height.min(chunks[2].y);
-            area.y = area.y.min(chunks[2].y.saturating_sub(area.height));
-        }
         frame.render_widget(Clear, area);
         let error = matches!(modal, Modal::Error { .. });
         let mut title = title_line(title);
@@ -1385,18 +1322,6 @@ fn render_hits(
                     y += height;
                 }
             }
-            Modal::Routing {
-                locked: false,
-                fields,
-                ..
-            } => {
-                for index in 0..fields.len() {
-                    hits.push(Hit {
-                        area: Rect::new(area.x + 1, area.y + 1 + index as u16, area.width - 2, 1),
-                        action: MouseAction::Field(index),
-                    });
-                }
-            }
             Modal::Personal { input, .. } | Modal::Rename { input, .. }
                 if Line::from(input.value.as_str()).width()
                     <= area.width.saturating_sub(2) as usize =>
@@ -1417,19 +1342,14 @@ fn render_hits(
                 ("Revoke token", KeyCode::Char('y')),
                 ("Cancel", KeyCode::Esc),
             ],
-            Modal::ResetConfirm(_) => {
-                &[("Use credit", KeyCode::Char('y')), ("Cancel", KeyCode::Esc)]
-            }
             Modal::ClipboardRetry { .. } => &[
                 ("Retry copy", KeyCode::Char('c')),
                 ("Discard", KeyCode::Esc),
             ],
-            Modal::Error { .. } | Modal::Help | Modal::Routing { locked: true, .. } => {
-                &[("Close", KeyCode::Esc)]
-            }
+            Modal::Error { .. } | Modal::Help => &[("Close", KeyCode::Esc)],
             Modal::Actions { .. } => &[("Close", KeyCode::Esc)],
             Modal::UpdateConfirm => &[("Update", KeyCode::Enter), ("Cancel", KeyCode::Esc)],
-            Modal::Personal { .. } | Modal::Rename { .. } | Modal::Routing { .. } => {
+            Modal::Personal { .. } | Modal::Rename { .. } => {
                 &[("Save", KeyCode::Enter), ("Cancel", KeyCode::Esc)]
             }
             Modal::Days { .. } => &[("Create token", KeyCode::Enter), ("Cancel", KeyCode::Esc)],
@@ -1453,27 +1373,6 @@ fn render_hits(
                     area.y + 1,
                 ));
             }
-        }
-        if let Modal::Routing {
-            fields,
-            selected,
-            locked: false,
-            ..
-        } = modal
-        {
-            let labels = [
-                "Priority (-255..255 / default)",
-                "All windows (0..100 / off / default)",
-                "Short window (0..100 / off / default)",
-                "Weekly window (0..100 / off / default)",
-            ];
-            let field = &fields[*selected];
-            let offset = Line::from(&field.value[..field.cursor]).width() as u16;
-            let column = area.x + 1 + 4 + labels[*selected].len() as u16 + offset;
-            frame.set_cursor_position((
-                column.min(area.right().saturating_sub(2)),
-                area.y + 1 + *selected as u16,
-            ));
         }
     }
     hits
@@ -1608,7 +1507,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) {
     }
     for (index, account) in accounts.into_iter().enumerate() {
         let label = format!(
-            "{}{} · Priority {}{}",
+            "{}{} · {}{}",
             render::safe(
                 account
                     .get("display_name")
@@ -1621,9 +1520,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) {
             } else {
                 ""
             },
-            account["preference"]["priority"]
-                .as_i64()
-                .map_or("unknown".into(), |n| n.to_string()),
+            render::account_routing(&account),
             if account["preference"]["locked"].as_bool() == Some(true) {
                 " · Locked"
             } else {
@@ -2006,7 +1903,7 @@ fn usage_chart(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) 
 }
 fn keyboard_help(state: &State, connection: &Connection) -> String {
     let actions = match state.tab {
-        OVERVIEW => "↑/↓: select account\nPgUp/PgDn: page\nEnter: account actions\nc: review reset credit (≤5% remaining)\nP: set numeric priority; S: switching rules; D: toggle activation\nOperator locks apply; reset credits require confirmation.",
+        OVERVIEW => "↑/↓: select account\nPgUp/PgDn: page\nEnter: account actions\nD: toggle activation; L: personal label\nRouting and expiring reset credits are automatic. Operator activation locks apply.",
         USAGE if state.group == 0 => "p: change period\nb: change grouping\nm: switch tokens / requests",
         USAGE => "↑/↓: select user, model or token with recorded usage\np: change period\nb: change grouping\nm: switch tokens / requests",
         TOKENS => "↑/↓: select token\nEnter: token actions\nn: create; l: rename; o: rotate; x: revoke\nRotation and revocation require confirmation.",
@@ -2080,24 +1977,9 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                 next_limits_refresh = Instant::now() + LIMIT_REFRESH_INTERVAL;
             }
             match result {
-                Ok(_value) if job.mutation && job.tab == OVERVIEW && !job.reset_confirm => {
+                Ok(_value) if job.mutation && job.tab == OVERVIEW => {
                     state.notices[OVERVIEW]=Some("Account preferences saved.".into());
                     pending=Some(start(&args.connection,ControlRequest::Limits,OVERVIEW,false));
-                }
-                Ok(value) if job.reset_prepare => {
-                    state.modal = Some(Modal::ResetConfirm(value));
-                    state.statuses[job.tab] =
-                        "Live limit checked. A credit will only be used after confirmation.".into();
-                }
-                Ok(value) if job.reset_confirm => {
-                    state.notices[job.tab] = Some(render::reset_outcome(&value));
-                    state.values[OVERVIEW] = None;
-                    pending = Some(start(
-                        &args.connection,
-                        ControlRequest::Limits,
-                        OVERVIEW,
-                        false,
-                    ));
                 }
                 Ok(mut value) if job.mutation => {
                     if job.tab == TOKENS {
@@ -2148,18 +2030,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                         TABS[job.tab],
                         chrono::Local::now().format("%H:%M:%S")
                     );
-                }
-                Err(error) if job.reset_prepare || job.reset_confirm => {
-                    let error = render::safe(&error.to_string());
-                    let message = if job.reset_confirm {
-                        format!("{error}\n\nCheck subscription limits before trying again; the request may have completed.")
-                    } else {
-                        error.to_string()
-                    };
-                    state.modal = Some(Modal::Error {
-                        title: if job.reset_confirm { "Reset credit failed" } else { "Reset credit unavailable" },
-                        message,
-                    });
                 }
                 Err(error) => {
                     state.statuses[job.tab] = format!(
@@ -2272,43 +2142,12 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                         state.modal = None;
                     }
                 }
-                Modal::Routing { account, fields, selected, error, locked, .. } => {
-                    if *locked {
-                        if matches!(key.code,KeyCode::Esc|KeyCode::Enter) { state.modal = None; }
-                    } else {
-                        match key.code {
-                            KeyCode::Esc => state.modal = None,
-                            KeyCode::Tab | KeyCode::Down => *selected = (*selected + 1) % fields.len(),
-                            KeyCode::BackTab | KeyCode::Up => *selected = (*selected + fields.len() - 1) % fields.len(),
-                            KeyCode::Enter => match routing_form(fields) {
-                                Ok(routing) => { mutation = Some(ControlRequest::AccountSet { account:*account, enabled:None, priority:None, routing:Some(routing) }); state.modal = None; },
-                                Err(message) => *error = message.to_string(),
-                            },
-                            _ => {
-                                if !matches!(key.code,KeyCode::Char(_)) || fields[*selected].value.len() < 16 || key.modifiers.contains(KeyModifiers::CONTROL) { fields[*selected].edit(key); }
-                                error.clear();
-                            },
-                        }
-                    }
-                },
                 Modal::UpdateConfirm => match key.code {
                     KeyCode::Esc | KeyCode::Char('n') => state.modal = None,
                     KeyCode::Enter | KeyCode::Char('y') => {
                         updater = Some(update_job(true)); state.update_checked = true;
                         state.modal = None; state.statuses[state.tab] = "Installing update… Keep this dashboard open until completion.".into();
                         state.notices[state.tab] = Some("Updating exr; source builds may take several minutes.".into());
-                    }
-                    _ => {}
-                },
-                Modal::ResetConfirm(value) => match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') => state.modal = None,
-                    KeyCode::Char('y') => {
-                        if let Some(confirmation) = value["confirmation"].as_str() {
-                            mutation = Some(ControlRequest::ResetConfirm {
-                                confirmation: confirmation.into(),
-                            });
-                            state.modal = None;
-                        }
                     }
                     _ => {}
                 },
@@ -2562,18 +2401,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                     let (title, entries)=action_menu(&state,&args.connection);
                     if entries.is_empty() { state.modal=Some(Modal::Error{title:"Account unavailable",message:format!("{title}\n\nThis account is deactivated and locked by the server operator.")}); } else { state.modal=Some(Modal::Actions{title,entries,selected:0}); }
                 }
-                KeyCode::Char('S') if state.tab == OVERVIEW => {
-                    if state.values[OVERVIEW].as_ref().is_none_or(|v| v["capabilities"]["account_routing_rules"] != 1) {
-                        state.modal = Some(Modal::Error { title: "Server update required", message: "Account routing rules require an updated server and SSH gateway.".into() });
-                    } else if let Some(row) = state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|rows|rows.get(state.account_selected)) {
-                        if let Some(account) = row["id"].as_i64() {
-                            let preference = &row["preference"];
-                            let names = ["priority","switch_at","switch_at_short","switch_at_weekly"];
-                            let fields = names.iter().map(|name| TextInput::new(preference["settings"][*name].as_i64().map(|n|n.to_string()).or_else(||preference["settings"][*name].as_str().map(str::to_owned)).unwrap_or("default".into()))).collect();
-                            state.modal = Some(Modal::Routing { account, fields, selected:0, error:String::new(), summary:format!("Effective priority: {}\n{}", preference["priority"],crate::account_preferences::describe(preference)), locked:preference["locked"] == true });
-                        }
-                    }
-                }
                 KeyCode::Char('D') if state.tab == OVERVIEW => {
                     if let Some(row)=state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|r|r.get(state.account_selected)) {
                         if row["preference"]["locked"] == true {
@@ -2589,13 +2416,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                             let value=row["display_name"].as_str().unwrap_or("").to_owned();
                             state.modal=Some(Modal::Personal {kind:super::privacy::Kind::Account,id:id.to_string(),input:TextInput::new(value)});
                         }
-                    }
-                }
-                KeyCode::Char('c') if state.tab == OVERVIEW => {
-                    if let Some(req) = selected_reset_request(&state) {
-                        pending = Some(start(&args.connection, req, OVERVIEW, false));
-                    } else {
-                        state.notices[state.tab] = Some("No account selected. Refresh Overview to load accounts.".into());
                     }
                 }
                 KeyCode::Char('n') if state.tab == TOKENS => {
@@ -2708,7 +2528,7 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                 }
             }
             state.notices[state.tab] = None;
-            let tab = if matches!(req, ControlRequest::ResetConfirm { .. } | ControlRequest::AccountSet { .. }) {
+            let tab = if matches!(req, ControlRequest::AccountSet { .. }) {
                 OVERVIEW
             } else if matches!(req,ControlRequest::PrivatePut {..}) {
                 state.tab
@@ -2818,20 +2638,6 @@ fn setup_cancelled(key: KeyEvent) -> bool {
     let key = shortcut_key(key);
     key.code == KeyCode::Esc
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-}
-
-fn routing_form(fields: &[TextInput]) -> Result<crate::account_preferences::RoutingArgs> {
-    use crate::account_preferences::{RoutingArgs, Setting};
-    let parse =
-        |i: usize| -> Result<Option<Setting>> { Ok(Some(fields[i].value.parse::<Setting>()?)) };
-    let routing = RoutingArgs {
-        priority: parse(0)?,
-        switch_at: parse(1)?,
-        switch_at_short: parse(2)?,
-        switch_at_weekly: parse(3)?,
-    };
-    routing.validate()?;
-    Ok(routing)
 }
 
 struct TextInput {
@@ -3499,65 +3305,16 @@ mod tests {
     }
 
     #[test]
-    fn routing_dialog_shows_all_fields_error_controls_and_cursor_on_minimum_terminal() {
-        let mut terminal = Terminal::new(TestBackend::new(72, 20)).unwrap();
-        let preference =
-            serde_json::to_value(crate::account_preferences::Preference::default()).unwrap();
-        let state = State {
-            modal: Some(Modal::Routing {
-                account: 1,
-                fields: ["1", "20", "off", "15"]
-                    .map(|text| TextInput::new(text.into()))
-                    .into(),
-                selected: 3,
-                error: "Switching threshold must be between 0 and 100, off or default".into(),
-                summary: format!(
-                    "Effective priority: 1\n{}",
-                    crate::account_preferences::describe(&preference)
-                ),
-                locked: false,
-            }),
-            ..Default::default()
-        };
-        terminal
-            .draw(|frame| render(frame, &state, &Connection::default(), false))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let text = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        for expected in [
-            "All windows",
-            "Short window",
-            "Weekly window",
-            "between 0 and 100",
-            "Tab / ↑ / ↓",
-            "Save Enter",
-            "Cancel Esc",
-        ] {
-            assert!(text.contains(expected), "missing {expected}: {text}");
-        }
-        assert!(terminal.backend().cursor_visible());
-    }
-    #[test]
-    fn routing_form_preserves_off_and_default_and_rejects_invalid_input() {
-        let fields = ["-255", "20", "off", "default"].map(|text| TextInput::new(text.into()));
-        let patch = routing_form(&fields).unwrap();
-        assert_eq!(
-            serde_json::to_value(patch).unwrap(),
-            serde_json::json!({"priority":-255,"switch_at":20,"switch_at_short":"off","switch_at_weekly":"default"})
+    fn account_actions_have_no_manual_routing_or_redemption() {
+        let mut state = State::default();
+        state.values[OVERVIEW] = Some(
+            serde_json::json!({"quota_accounts":[{"id":1,"preference":{"enabled":true,"locked":false}}]}),
         );
-        for invalid in ["256", "-256", "off", "1.5", ""] {
-            let mut invalid_fields =
-                ["-255", "20", "off", "default"].map(|text| TextInput::new(text.into()));
-            invalid_fields[0] = TextInput::new(invalid.into());
-            assert!(routing_form(&invalid_fields).is_err());
-        }
-        let mut default_fields = fields;
-        default_fields[0] = TextInput::new("default".into());
-        assert!(routing_form(&default_fields).is_ok());
+        let (_, actions) = action_menu(&state, &Connection::default());
+        assert_eq!(
+            actions.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
+            [KeyCode::Char('D'), KeyCode::Char('L')]
+        );
     }
     #[test]
     fn connection_input_edits_unicode_at_the_cursor_and_scrolls() {
@@ -3896,7 +3653,7 @@ mod tests {
         );
     }
     #[test]
-    fn account_selection_scrolls_and_reset_targets_survive_reordered_refresh() {
+    fn account_selection_scrolls_and_survives_reordered_refresh() {
         let mut state = State::default();
         state.values[OVERVIEW] = Some(serde_json::json!({"quota_accounts":[
             {"id":11,"label":"alice@example.com","quota":{"windows":[{"window_minutes":10080,"remaining_percent":5,"status":"current"}]}},
@@ -3905,10 +3662,6 @@ mod tests {
         select_item(&mut state, true, 10, 66);
         assert_eq!(state.account_selected, 1);
         assert!(state.scroll > 0);
-        assert!(matches!(
-            selected_reset_request(&state),
-            Some(ControlRequest::ResetPrepare { account: 22 })
-        ));
         let mut terminal = Terminal::new(TestBackend::new(72, 20)).unwrap();
         terminal
             .draw(|f| render(f, &state, &Connection::default(), false))
@@ -3934,15 +3687,8 @@ mod tests {
         preserve_selection(&mut state, OVERVIEW, &refreshed);
         state.values[OVERVIEW] = Some(refreshed);
         assert_eq!(state.account_selected, 0);
-        assert!(matches!(
-            selected_reset_request(&state),
-            Some(ControlRequest::ResetPrepare { account: 22 })
-        ));
         select_item(&mut state, true, 10, 66);
-        assert!(matches!(
-            selected_reset_request(&state),
-            Some(ControlRequest::ResetPrepare { account: 11 })
-        ));
+        assert_eq!(state.account_selected, 1);
     }
     #[test]
     fn model_selection_matches_reversed_rows_and_keeps_selected_id_visible() {
@@ -4063,15 +3809,13 @@ mod tests {
         assert!(finish_update(&mut report).contains("already up to date"));
     }
     #[test]
-    fn reset_dialog_shows_warning_and_confirmation_on_the_minimum_terminal() {
+    fn automatic_routing_status_is_visible_on_the_minimum_terminal() {
         assert_eq!(TABS, ["Overview", "Usage", "Tokens", "Models", "Settings"]);
         let mut terminal = Terminal::new(TestBackend::new(72, 20)).unwrap();
-        let state = State {
-            modal: Some(Modal::ResetConfirm(
-                serde_json::json!({"email":"test@example.com","remaining_percent":5,"available_count":2,"credit_title":"Full reset","free_reset_at":2000000000,"recommend_wait":true}),
-            )),
-            ..Default::default()
-        };
+        let mut state = State::default();
+        state.values[OVERVIEW] = Some(
+            serde_json::json!({"quota_accounts":[{"id":1,"label":"synthetic","routing":{"reason":"reset_expiring"},"automatic_reset":{"status":"reset"},"quota":{"windows":[]}}]}),
+        );
         terminal
             .draw(|f| render(f, &state, &Connection::default(), false))
             .unwrap();
@@ -4082,9 +3826,9 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("less than 3 days"));
-        assert!(text.contains("Use credit y"));
-        assert!(text.contains("Cancel Esc"));
+        assert!(text.contains("Urgent"));
+        assert!(text.contains("auto reset: reset"));
+        assert!(!text.contains("Use credit"));
     }
     #[test]
     fn quota_backgrounds_follow_percentages_with_contrasting_text() {

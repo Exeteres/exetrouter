@@ -378,10 +378,11 @@ impl Upstream {
                 if let Some(wait)=wait { earliest=Some(earliest.map_or(wait,|old:(i64,bool)|if wait.0<old.0 {wait} else {old}));continue; }
                 if expires<=now+60 { continue; }
                 let summary=crate::quota::summary(conn,id,now)?;
-                if preference.rules.reached(&summary) { thresholds.push(id); }
+                let routing=crate::routing::decision(conn,id,now)?;
+                if routing.reached(&summary) { thresholds.push(id); }
                 if summary.windows.iter().any(|window| window.status=="current" && window.used_percent>=100.0 && window.reset_at.is_some_and(|at|at>now)) { exhausted.push(id); }
                 let quota=if summary.status=="observed" { summary.windows.iter().map(|window|window.used_percent).reduce(f64::max) } else { None };
-                candidates.push(crate::pool::Candidate { id,quota,priority:preference.priority });
+                candidates.push(crate::pool::Candidate { id,quota,routing });
             }
             Ok((candidates,earliest,exhausted,thresholds))
         }).await.map_err(|_|SelectError::UpstreamUnavailable)?;
@@ -477,12 +478,12 @@ impl Upstream {
     ) -> std::result::Result<bool, SelectError> {
         self.db
             .call(move |conn| {
-                let preference = crate::account_preferences::effective(conn, Some(user), id)?;
-                Ok(preference.rules.reached(&crate::quota::summary(
-                    conn,
-                    id,
-                    Utc::now().timestamp(),
-                )?))
+                if !crate::account_preferences::effective(conn, Some(user), id)?.enabled {
+                    return Ok(false);
+                }
+                let now = Utc::now().timestamp();
+                Ok(crate::routing::decision(conn, id, now)?
+                    .reached(&crate::quota::summary(conn, id, now)?))
             })
             .await
             .map_err(|_| SelectError::UpstreamUnavailable)
@@ -504,13 +505,31 @@ impl Upstream {
         let pinned = self.select_pinned_for_user(model, id, Some(user)).await;
         let exhausted = self.quota_exhausted(id).await?;
         let threshold = self.threshold_reached(user, id).await?;
-        if (exhausted || threshold) && matches!(pinned, Ok(_) | Err(SelectError::Cooldown(_))) {
+        let preempted = self.routing_preempted(model, user, id).await?;
+        if (exhausted || threshold || preempted)
+            && matches!(pinned, Ok(_) | Err(SelectError::Cooldown(_)))
+        {
             if let Ok(alternate) = self
                 .select_excluding(model, affinity, Some(user), &[id])
                 .await
             {
                 // Avoid leaving credit-backed capacity for another exhausted subscription.
-                if !self.quota_exhausted(alternate.info.id).await?
+                let better = if !exhausted && !threshold {
+                    let alternative = alternate.info.id;
+                    self.db
+                        .call(move |conn| {
+                            let now = Utc::now().timestamp();
+                            Ok(crate::routing::decision(conn, alternative, now)?
+                                .compare(&crate::routing::decision(conn, id, now)?)
+                                .is_lt())
+                        })
+                        .await
+                        .map_err(|_| SelectError::UpstreamUnavailable)?
+                } else {
+                    true
+                };
+                if better
+                    && !self.quota_exhausted(alternate.info.id).await?
                     && (exhausted
                         || !threshold
                         || !self.threshold_reached(user, alternate.info.id).await?)
@@ -520,6 +539,44 @@ impl Upstream {
             }
         }
         pinned
+    }
+
+    /// A better economic tier may preempt a healthy session only through the
+    /// existing full-context soft-transfer path, never during a generation.
+    pub(crate) async fn routing_preempted(
+        &self,
+        model: &str,
+        user: i64,
+        owner: i64,
+    ) -> std::result::Result<bool, SelectError> {
+        let requested = model.to_owned();
+        let ids=self.db.call(move |conn|{
+            let now=Utc::now().timestamp();
+            let current=crate::routing::decision(conn,owner,now)?;
+            let mut stmt=conn.prepare("SELECT a.id FROM oauth_accounts a JOIN oauth_models m ON m.account_id=a.id WHERE a.id<>?1 AND a.state='active' AND m.model=?2 AND a.expires_at>?3+60 AND (a.cooldown_until IS NULL OR a.cooldown_until<=?3) AND NOT EXISTS(SELECT 1 FROM oauth_health h WHERE h.account_id=a.id AND h.generation=a.generation AND h.retry_at>?3)")?;
+            let ids=stmt.query_map(params![owner,requested,now],|r|r.get::<_,i64>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut urgent=Vec::new();
+            for id in ids {
+                if !crate::account_preferences::effective(conn,Some(user),id)?.enabled {continue;}
+                let candidate=crate::routing::decision(conn,id,now)?;
+                let quota=crate::quota::summary(conn,id,now)?;
+                if candidate.compare(&current).is_lt() && !candidate.reached(&quota) && quota.status=="observed" {urgent.push((candidate,id));}
+            }
+            urgent.sort_by(|(a,aid),(b,bid)|a.compare(b).then_with(||aid.cmp(bid)));
+            Ok(urgent.into_iter().map(|(_,id)|id).take(4).collect::<Vec<_>>())
+        }).await.map_err(|_|SelectError::UpstreamUnavailable)?;
+        // An idle alternative's catalog may have aged out during a long owned
+        // session. Refresh it on demand, not with background inference/probes.
+        for id in ids {
+            if self
+                .account_models(id)
+                .await
+                .is_ok_and(|models| models.iter().any(|m| m.id == model))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn check_available(&self) -> std::result::Result<(), SelectError> {
@@ -611,7 +668,7 @@ impl Upstream {
             .reserve(&[crate::pool::Candidate {
                 id,
                 quota: None,
-                priority: 0,
+                routing: Default::default(),
             }])
             .expect("one candidate");
         let account = self

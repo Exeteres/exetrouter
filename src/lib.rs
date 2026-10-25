@@ -18,6 +18,7 @@ mod pool;
 mod private_metadata;
 pub mod quota;
 pub mod reset;
+pub mod routing;
 pub mod server;
 pub mod server_config;
 pub mod store;

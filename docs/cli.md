@@ -1,6 +1,6 @@
 # Client CLI and TUI
 
-The dashboard supports mouse clicks on tabs, account/token/model rows, action menus and bottom controls. Clicking an account or token selects it and opens its actions; clicking a model selects it and copies its ID, just like Enter. Settings actions are inline: Check updates appears first and becomes Update when an update is available; Configure connection is in Connection. Use Up/Down and Enter or click an action. Bottom buttons and action-menu entries display their shortcuts. Buttons wrap on narrow screens; Controls contains navigation hints without repeating button shortcuts. The wheel uses the same selection/scroll behavior as Up/Down. Dialog buttons retain explicit confirmation for token rotation/revocation, reset credits and updates, and block clicks on the background. Switching-rule fields support click-to-focus and cursor placement; account-label fields support cursor placement too. All keyboard controls remain available, with `1`–`5` as direct tab shortcuts. Help accepts `?` or `/` (also the Russian-layout `.`/`,` on the same key). EN/RU command shortcuts work in either layout, including action menus and confirmation dialogs; text fields are not transliterated. Other physical-key layouts cannot be inferred from ordinary terminal character events. Terminal text selection usually requires Shift while mouse capture is active, depending on the terminal. Connection setup and browser sign-in remain keyboard-driven.
+The dashboard supports mouse clicks on tabs, account/token/model rows, action menus and bottom controls. Clicking an account or token selects it and opens its actions; clicking a model selects it and copies its ID, just like Enter. Settings actions are inline: Check updates appears first and becomes Update when an update is available; Configure connection is in Connection. Use Up/Down and Enter or click an action. Bottom buttons and action-menu entries display their shortcuts. Buttons wrap on narrow screens; Controls contains navigation hints without repeating button shortcuts. The wheel uses the same selection/scroll behavior as Up/Down. Dialog buttons retain explicit confirmation for token rotation/revocation and updates, and block clicks on the background. Account-label fields support cursor placement. All keyboard controls remain available, with `1`–`5` as direct tab shortcuts. Help accepts `?` or `/` (also the Russian-layout `.`/`,` on the same key). EN/RU command shortcuts work in either layout, including action menus and confirmation dialogs; text fields are not transliterated. Other physical-key layouts cannot be inferred from ordinary terminal character events. Terminal text selection usually requires Shift while mouse capture is active, depending on the terminal. Connection setup and browser sign-in remain keyboard-driven.
 
 `exr` runs a standalone API or connects to a shared server on macOS/Linux. Run it without a command to open the dashboard. CLI reports use readable text; add `--json` for scripts.
 
@@ -46,10 +46,8 @@ exr usage --period 24h
 exr usage --period week --by user
 exr usage --period week --by token
 exr usage --period month --by model --json
-exr account set 1 --priority 10 --switch-at 20 # Prefer until ≤20% remains
-exr account set 1 --switch-at-short off --switch-at-weekly 15
-exr account set 1 --priority -255 # Lowest numeric priority
-exr account set 1 --priority default --switch-at default # Inherit operator values
+exr account set 1 --enabled false # Reversibly deactivate for this user
+exr account enable 1             # Reactivate; routing is automatic
 exr account set 1 --enabled false # Reversible deactivation for your user
 exr limits                  # Per-account upstream subscription windows
 exr limits --json            # Array of live account limits and reset credits, labeled by email
@@ -77,7 +75,7 @@ Use an interactive terminal at least 72 columns × 20 rows. Press `?` for help o
 
 | View | What you can do |
 | --- | --- |
-| Overview | Inspect routing/account health and subscription limits. Enter opens account actions: reset-credit review, switching rules (including priority) and activation. Operator locks apply. |
+| Overview | Inspect automatic routing, reset outcomes and subscription limits. Enter opens account activation and personal-label actions. Operator activation locks apply. |
 | Usage | View Today, Last 24 hours, This week or This month, grouped by total, user, model or your API tokens. |
 | Tokens | Create, rename, rotate or revoke tokens. Revoked tokens are hidden. Enter opens actions. |
 | Models | Browse account-visible models and reported limits. Enter copies the selected model ID. |
@@ -87,11 +85,11 @@ Use an interactive terminal at least 72 columns × 20 rows. Press `?` for help o
 
 Tokens: Enter → Rename token (or `l`) edits the selected label. Enter saves, Esc cancels, and Ctrl-U clears the field. Labels must be 1–80 bytes without control characters. Renaming encrypts the new label on the client and changes neither the bearer secret, token ID, expiry nor usage counters; past usage displays the new label on reload. CLI renaming also supports `--json` and requires no clipboard or interactive terminal.
 
-Overview: `S` opens Switching rules (also accessible through Enter). The form accepts priority -255…255, thresholds 0…100, `off` and `default`. Tab/Up/Down selects a field, Enter saves all edits, Esc cancels, and invalid values remain editable without sending a mutation. Locked rules can be inspected but not changed. Controls shows contextual hints. Overview shows effective priority; switching thresholds appear only in the settings form. Thresholds are soft: without a suitable alternative, a healthy original account continues. See [selection and inheritance](account-pool.md#soft-switching-thresholds).
+Overview shows the automatic routing reason and latest reset outcome. `D` toggles activation and `L` edits a personal label. There are no manual priority, switching-rule or reset-redemption actions. Soft transfers preserve a healthy original account when complete context or an eligible replacement is unavailable. See [automatic selection](account-pool.md#ranking-and-switching).
 
 Connection fields support Left/Right, Home/End (Ctrl-A/Ctrl-E), Backspace/Delete and Ctrl-U to clear. Up/Down selects a field. Esc cancels edits; Ctrl-C exits without saving. Remote settings are saved after a successful SSH check.
 
-Rotation and revocation need `y` confirmation. Esc cancels dialogs; reset-credit error dialogs close with Enter or Esc. Action results and errors appear above the Controls hints.
+Token rotation and revocation need `y` confirmation. Esc cancels dialogs. Action results and errors appear above the Controls hints.
 
 ### Clipboard and uncertain mutations
 
@@ -119,7 +117,7 @@ The client sends its system IANA time zone for Usage calendar boundaries. The se
 
 ## Weekly activation
 
-A fresh weekly window (10080 minutes) with **100% remaining** and a reset exactly seven days after the observation, compared at minute precision, is treated as apparently inactive. Live limits submit one minimal `gpt-5.6-sol` Responses request on that exact account to start the window, then reread usage. The account must be enabled for the authenticated user, operationally available and support this model. A recent ordinary request suppresses activation. Requests use low reasoning, no tools and a fixed short prompt; generated content is discarded. Catalog, Doctor, update checks and reset-credit previews remain free of inference.
+A fresh weekly window (10080 minutes) with **100% remaining** and a reset exactly seven days after the observation, compared at minute precision, is treated as apparently inactive. Live limits submit one minimal `gpt-5.6-sol` Responses request on that exact account to start the window, then reread usage. The account must be enabled for the authenticated user, operationally available and support this model. A recent ordinary request suppresses activation. Requests use low reasoning, no tools and a fixed short prompt; generated content is discarded. Catalog, Doctor, update checks and the automatic metadata worker remain free of inference.
 
 The attempt is recorded before submission and limited to once per account in seven days across users, processes and restarts. Only one activation runs at a time, with a 20-second inference deadline and 64 KiB response limit. Overview and readable limits show the latest attempt status for seven days. Nullable numeric usage is retained and included in total, model and user reports; these requests have no API token and are excluded from token grouping. This pattern is a heuristic, not an upstream guarantee that a zero-percent window is inactive. Schema 8 requires the [migration and rollback plan](quota-activation-migration.md).
 
@@ -127,11 +125,15 @@ The attempt is recorded before submission and limited to once per account in sev
 
 `exr limits` and Overview read live usage and reset-credit availability. A failed read keeps historical observations and reports the refresh error. Doctor remains a local snapshot, including any cached credit metadata.
 
-Run `exr limits reset <email>` in an interactive terminal, or open the selected account with Enter in Overview and choose Review reset credit. Duplicate emails can be distinguished by local numeric account ID. The server requires a current ordinary subscription window with **≤5% remaining**, a known future reset time and an available reset credit. Unknown/elapsed windows are ineligible. Unsupported or expired detail rows cannot be consumed. The earliest-expiring supported credit is selected; if details are unavailable but usage reports credits, the upstream can select its next credit.
+The running server/standalone API manages resets automatically, even with the dashboard closed. It spends only supported, available credits with a known expiry. At **less than 72 hours to expiry**, a current weekly window with **≤1% remaining** qualifies, regardless of other subscriptions' capacity. During the final **24 hours**, consumed current ordinary quota qualifies for one early salvage, even above 1% weekly remaining. A fully unused account is not reset. Credits already in the final-day cohort must then wait for new weekly depletion to ≤1% until that cohort expires; a little new usage cannot consume the entire stock. Short-window exhaustion alone does not qualify a 24–72-hour credit. Longer-lived strategic credits are never automatically consumed. The 1% condition is for redemption only: normal routing consumes available quota through exhaustion.
 
-Review the account, remaining percentage, credit expiry and free reset time, then type `yes` in the CLI or `y` in the TUI. When an eligible window resets in less than three days, the confirmation recommends saving the credit and waiting for the free reset. There is no `--yes` bypass and reset consumption rejects `--json`.
+The earliest-expiring supported credit is selected with a deterministic ID tie-break. Before POST, wait a randomized delay of up to one minute, then fetch fresh usage and credit inventory again. Cancel if the selected credit or weekly cycle changed, eligibility changed, authorization/generation changed or operational backoff applies. Independent installations derive the same upstream UUID idempotency key from the upstream account and its weekly reset deadline, and always send an explicit `credit_id`. Different credits observed against the same unrecovered weekly cycle therefore share one redemption key. Random timing alone is not duplicate-consumption protection; correctness depends on upstream honoring redemption idempotency.
 
-Confirmation belongs to the SSH user, expires after two minutes and can be submitted only once. The server rechecks live limits, credit availability, account generation and SSH authorization before sending the idempotent consume request. It does not automatically retry a mutation. On timeout or an ambiguous response, inspect live limits before any further action. Service restart invalidates pending confirmations. Credit consumption is verified against mock endpoints; production credits are never spent by automated tests.
+Persist digest-only cycle/credit identities and a numeric quota snapshot before submission. Every potentially successful outcome, including `reset` and `already_redeemed`, blocks another credit until fresh explicitly allowed limits show >1% in all reported windows, a strict usage decrease in every previously consumed window and a changed weekly reset deadline. An unchanged deadline does not authorize another automatic redemption. Uncertain requests are never replayed, including after restart; verified recovery is recorded separately from claimed success. A confirmed `nothing_to_reset`, `no_credit` or rejection does not permanently spend the credit: fresh additional consumption may rearm it after at least 30 seconds, reusing the same cycle key.
+
+Inventory disappearance on a monitoring host independently fences the next credit and records the final-day cohort, including when another host performed the reset. These observations and recovery/cohort fences survive restart. This is not a shared distributed ledger: an independently initialized host cannot reconstruct another host's previous salvage history from an available-only inventory. Use remote clients of one authoritative runtime when shared cohort history is required. Reads cannot guarantee an atomic snapshot across upstream endpoints; missing or contradictory recovery evidence defers further redemption.
+
+Read limits after the response; never infer new percentages from a successful POST. Matching subscription cooldowns recover only through the existing fenced live-usage path. Manual `limits reset`, reset confirmations and routing flags are removed; old management redemption requests fail explicitly. Tests use synthetic endpoints only. Doctor and Limits do not themselves redeem credits, but the runtime worker operates independently of those reads. See [schema 12 deployment/rollback](automatic-routing-migration.md).
 
 ## Software updates
 

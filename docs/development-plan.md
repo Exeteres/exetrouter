@@ -21,7 +21,7 @@ Remaining acceptance:
 - Live WS encrypted-function-argument portability and multi-hour/concurrent failover.
 - Live multi-hour/repeated-transfer validation of client-carried portability receipts, including compaction and reconnect. New transfers no longer grow the legacy registry; ordinary tests verify repeated transfers without context writes.
 
-Require bounded memory/tasks/queues, correct unknown usage, normal affinity, authorized quota-only transfers. Give explicit recovery instructions when an owned WS cannot resume. The optional two-hour idle harness is implemented but has not been run for that duration.
+Require bounded memory/tasks/queues, correct unknown usage, normal affinity, and authorized quota/automatic-soft transfers with complete current context. Give explicit recovery instructions when an owned WS cannot resume. The optional two-hour idle harness is implemented but has not been run for that duration.
 
 Before updating compatibility claims, inspect exact current release sources and run the drift check:
 

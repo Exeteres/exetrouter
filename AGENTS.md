@@ -31,7 +31,7 @@ Read the relevant contract before changing behavior: `docs/openai-api.md`, `docs
 - Preserve bounded memory, queues, concurrency and tasks. Resource protection is separate from subscription limits; do not introduce request-frequency/IP quotas without a product requirement.
 - Preserve server-side identity resolution, Unix peer UID checks and private file permissions. Never grant the restricted SSH gateway Docker access, broad sudo access or a public HTTP management API.
 - OAuth keys, token signing keys, state and user settings must survive upgrades. Do not rotate credentials or overwrite a profile just to install a new version.
-- Reset credits require live eligibility verification, at most 5% remaining and explicit confirmation. Recommend waiting when a free reset is less than three days away. Do not automatically retry a credit mutation.
+- Reset credits are automatic: less than 72 hours to expiry and at most 1% weekly remaining, or one final-day salvage for the currently expiring cohort with consumed ordinary quota. Strategic resets never influence ranking or automatic spending. Ordinary routing uses quota through exhaustion, not a 1% switching threshold. Recheck after randomized delay, select an explicit credit and use a host-independent account/weekly-cycle idempotency key. Persist before POST; every submitted reset requires observed recovery and a changed weekly cycle before another credit. Unknown outcomes are never retried; confirmed no-ops may be reconsidered only after fresh new consumption with the same cycle key. Retain cohort and inventory-change fences across restart.
 
 ## User experience
 
@@ -39,7 +39,7 @@ Human-readable output is the default; `--json` is the explicit automation interf
 
 - Put contextual key hints in the bottom Controls area. Navigate left/right across Overview, Usage, Tokens, Models and Settings.
 - Use a borderless header: ExetRouter/version on the left, connection on the right, tabs beneath with one-space selection padding.
-- Enter opens account/token/Settings actions. Enforce operator locks on the server. Deactivation is reversible and retains OAuth state; reset-credit errors use dismissible dialogs.
+- Enter opens account/token/Settings actions. Enforce operator activation locks on the server. Deactivation is reversible and retains OAuth state. Account routing and expiring reset credits are automatic; do not reintroduce manual priority, switching-rule or redemption controls.
 - Highlight Settings for client updates; server updates belong to the operator.
 - Check clipboard support before token issuance/rotation, then copy secrets without rendering them.
 

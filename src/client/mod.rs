@@ -83,10 +83,7 @@ enum CommandLine {
     Tui,
     /// Show upstream subscription windows for each account.
     #[command(alias = "quota")]
-    Limits {
-        #[command(subcommand)]
-        command: Option<LimitsCommand>,
-    },
+    Limits,
     /// Show usage totals for today, the last 24 hours, this week or this month.
     Usage {
         #[arg(long, default_value = "day", value_parser = ["day", "24h", "week", "month"])]
@@ -117,13 +114,11 @@ enum CommandLine {
 
 #[derive(Subcommand)]
 enum AccountCommand {
-    /// Set reversible routing preferences for your user (remote or standalone).
+    /// Set reversible availability for your user (remote or standalone).
     Set {
         id: i64,
         #[arg(long,action=clap::ArgAction::Set)]
         enabled: Option<bool>,
-        #[command(flatten)]
-        routing: crate::account_preferences::RoutingArgs,
     },
     /// Reactivate an account for your user without signing in again.
     Enable { id: i64 },
@@ -139,12 +134,6 @@ enum AccountCommand {
         #[arg(long)]
         yes: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum LimitsCommand {
-    /// Consume one reset credit after a live check and mandatory confirmation.
-    Reset { account: String },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -262,47 +251,24 @@ async fn run_session(args: &Session, config_path: &std::path::Path) -> Result<()
     }
     if let CommandLine::Account { command } = &args.command {
         let preference = match command {
-            AccountCommand::Set {
-                id,
-                enabled,
-                routing,
-            } => {
-                routing.validate()?;
-                Some((
-                    *id,
-                    *enabled,
-                    (routing.priority.is_some()
-                        || routing.switch_at.is_some()
-                        || routing.switch_at_short.is_some()
-                        || routing.switch_at_weekly.is_some())
-                    .then(|| routing.clone()),
-                ))
-            }
-            AccountCommand::Enable { id } => Some((*id, Some(true), None)),
+            AccountCommand::Set { id, enabled } => Some((*id, *enabled)),
+            AccountCommand::Enable { id } => Some((*id, Some(true))),
             AccountCommand::Disable { id, yes } => {
                 if !yes {
                     config::confirm("Deactivate this account for your user?")?;
                 }
-                Some((*id, Some(false), None))
+                Some((*id, Some(false)))
             }
             _ => None,
         };
-        if let Some((id, enabled, routing)) = preference {
-            if routing.is_some() && args.connection.local.is_none() {
-                let report = ssh_request(args, ControlRequest::Doctor).await?;
-                if report["capabilities"]["account_routing_rules"] != 1 {
-                    return Err(
-                        "Account routing rules require an updated server and SSH gateway".into(),
-                    );
-                }
-            }
+        if let Some((id, enabled)) = preference {
             let value = ssh_request(
                 args,
                 ControlRequest::AccountSet {
                     account: id,
                     enabled,
                     priority: None,
-                    routing,
+                    routing: None,
                 },
             )
             .await?;
@@ -310,11 +276,8 @@ async fn run_session(args: &Session, config_path: &std::path::Path) -> Result<()
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!(
-                    "Account preferences\n\nEnabled   {}\nPriority  {}\nLocked    {}\n{}",
-                    value["enabled"],
-                    value["priority"],
-                    value["locked"],
-                    crate::account_preferences::describe(&value)
+                    "Account availability\n\nEnabled   {}\nLocked    {}\nRouting   automatic",
+                    value["enabled"], value["locked"],
                 );
             }
             return Ok(());
@@ -366,10 +329,7 @@ async fn run_session(args: &Session, config_path: &std::path::Path) -> Result<()
         }
         return tui::run(args, config_path).await;
     }
-    if let CommandLine::Limits { command } = &args.command {
-        if let Some(LimitsCommand::Reset { account }) = command {
-            return reset_credit(args, account).await;
-        }
+    if let CommandLine::Limits = &args.command {
         let value = ssh_request(args, ControlRequest::Limits).await?;
         if args.json {
             println!(
@@ -447,7 +407,7 @@ async fn run_session(args: &Session, config_path: &std::path::Path) -> Result<()
         CommandLine::Models { .. } => ControlRequest::Models,
         CommandLine::Update { .. }
         | CommandLine::Doctor
-        | CommandLine::Limits { .. }
+        | CommandLine::Limits
         | CommandLine::Configure
         | CommandLine::Serve
         | CommandLine::Account { .. }
@@ -548,47 +508,6 @@ async fn run_session(args: &Session, config_path: &std::path::Path) -> Result<()
             render::terminal(&render::response(&request_kind(&args.command), &result))
         );
     }
-    Ok(())
-}
-
-async fn reset_credit(args: &Session, account: &str) -> Result<()> {
-    if args.json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err(
-            "Reset credits require an interactive terminal and confirmation; --json is disabled"
-                .into(),
-        );
-    }
-    let limits = ssh_request(args, ControlRequest::Limits).await?;
-    let rows = limits["quota_accounts"]
-        .as_array()
-        .ok_or("Account list unavailable")?;
-    let matches: Vec<_> = rows
-        .iter()
-        .filter(|row| {
-            row["label"]
-                .as_str()
-                .is_some_and(|email| email.eq_ignore_ascii_case(account))
-                || row["id"]
-                    .as_i64()
-                    .is_some_and(|id| Some(id) == account.parse::<i64>().ok())
-        })
-        .collect();
-    if matches.len() != 1 {
-        return Err("Select one account by email (or numeric ID if the same email belongs to several accounts)".into());
-    }
-    let id = matches[0]["id"].as_i64().ok_or("Account ID unavailable")?;
-    let preview = ssh_request(args, ControlRequest::ResetPrepare { account: id }).await?;
-    println!(
-        "{}",
-        render::terminal(&render::reset_confirmation(&preview))
-    );
-    config::confirm("Use one reset credit?")?;
-    let confirmation = preview["confirmation"]
-        .as_str()
-        .ok_or("Reset confirmation unavailable")?
-        .into();
-    let result = ssh_request(args, ControlRequest::ResetConfirm { confirmation }).await?;
-    println!("{}", render::reset_outcome(&result));
     Ok(())
 }
 

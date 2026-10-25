@@ -238,14 +238,6 @@ impl Local {
                     })
                     .await
             }
-            ControlRequest::ResetPrepare { account } => {
-                self.upstream.prepare_reset(self.user, account).await
-            }
-            ControlRequest::ResetConfirm { confirmation } => {
-                self.upstream
-                    .confirm_local_reset(self.user, &confirmation)
-                    .await
-            }
             other => {
                 let key = self.key.clone();
                 let user = self.user;

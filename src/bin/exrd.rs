@@ -152,13 +152,11 @@ enum BackupCommand {
 enum OauthCommand {
     /// Create the OAuth encryption key for an existing pre-OAuth installation.
     InitKey,
-    /// Set reversible routing availability/priority for everyone and lock client changes.
+    /// Set reversible availability for everyone and lock client activation changes.
     Policy {
         id: i64,
         #[arg(long, action=clap::ArgAction::Set)]
         enabled: Option<bool>,
-        #[command(flatten)]
-        routing: exetrouter::account_preferences::RoutingArgs,
         #[arg(long, action=clap::ArgAction::Set)]
         locked: Option<bool>,
     },
@@ -397,6 +395,7 @@ async fn run() -> Result<()> {
             db,
             key,
             ServeConfig {
+                account_maintenance: true,
                 gateway_uid,
                 listen,
                 socket: args.control_socket,
@@ -453,14 +452,13 @@ async fn run() -> Result<()> {
             OauthCommand::Policy {
                 id,
                 enabled,
-                routing,
                 locked,
             } => print_report(
                 "Account routing policy",
                 &db.call(move |conn| {
                     Ok(serde_json::to_value(
-                        exetrouter::account_preferences::set_policy_rules(
-                            conn, id, enabled, None, locked, &routing,
+                        exetrouter::account_preferences::set_policy(
+                            conn, id, enabled, None, locked,
                         )?,
                     )?)
                 })
@@ -702,11 +700,8 @@ fn print_report(title: &str, value: &impl serde::Serialize, machine: bool) -> Re
         println!("{title}\n");
         if title == "Account routing policy" {
             println!(
-                "Enabled   {}\nPriority  {}\nLocked    {}\n{}",
-                value["enabled"],
-                value["priority"],
-                value["locked"],
-                exetrouter::account_preferences::describe(&value)
+                "Enabled   {}\nLocked    {}\nRouting   automatic",
+                value["enabled"], value["locked"],
             );
         } else {
             print_value(&value, 0);

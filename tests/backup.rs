@@ -76,19 +76,7 @@ fn state() -> State {
         [account],
     )
     .unwrap();
-    exetrouter::account_preferences::set_user_rules(
-        &mut conn,
-        user,
-        account,
-        None,
-        None,
-        &exetrouter::account_preferences::RoutingArgs {
-            priority: Some(exetrouter::account_preferences::Setting::Number(255)),
-            switch_at: Some(exetrouter::account_preferences::Setting::Number(20)),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    exetrouter::account_preferences::set_user(&mut conn, user, account, Some(false), None).unwrap();
     State {
         directory,
         paths,
@@ -208,8 +196,7 @@ fn cli_snapshot_includes_live_wal_keys_and_restores_a_restartable_state() {
     assert!(account.credentials.access_token == "fixture-access");
     assert!(account.credentials.refresh_token == "fixture-refresh");
     let preferences = exetrouter::account_preferences::effective(&conn, Some(1), 1).unwrap();
-    assert_eq!(preferences.priority, 255);
-    assert_eq!(preferences.rules.switch_at, Some(20));
+    assert!(!preferences.enabled);
     for table in ["context_bindings", "oauth_quota_windows", "oauth_health"] {
         assert_eq!(
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
