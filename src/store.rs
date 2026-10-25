@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/009_account_routing.sql"),
     include_str!("migrations/010_private_metadata.sql"),
     include_str!("migrations/011_cooldown_recovery.sql"),
+    include_str!("migrations/012_automatic_routing.sql"),
 ];
 pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 const QUEUE_CAPACITY: usize = 32;
@@ -33,6 +34,7 @@ pub fn init(conn: &Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", index + 1)?;
     }
     tx.execute("UPDATE quota_activation_attempts SET status='unknown' WHERE status='pending' AND attempted_at<=?1", [chrono::Utc::now().timestamp()-60])?;
+    tx.execute("UPDATE automatic_reset_attempts SET status='unknown' WHERE status='submitted' AND attempted_at<=?1", [chrono::Utc::now().timestamp()-120])?;
     tx.commit()?;
     Ok(())
 }
@@ -135,7 +137,7 @@ mod tests {
         assert_eq!(state, ("1234".into(), 7, 2000, "upstream_reset".into(), 0));
         let tx = conn.transaction().unwrap();
         tx.execute_batch(
-            "ALTER TABLE oauth_accounts DROP COLUMN cooldown_order; PRAGMA user_version=10;",
+            "DROP TABLE account_routing_metadata; DROP TABLE automatic_reset_attempts; ALTER TABLE oauth_accounts DROP COLUMN cooldown_order; PRAGMA user_version=10;",
         )
         .unwrap();
         tx.commit().unwrap();
@@ -146,6 +148,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn automatic_routing_migration_and_reviewed_reupgrade_preserve_attempts_and_policy() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..11] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn.execute(
+            "INSERT INTO users(id,name,created_at) VALUES(1,'synthetic',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO oauth_accounts(account_id,state,encrypted_credentials,expires_at,created_at) VALUES('synthetic','active',X'1234',9999,0)",[]).unwrap();
+        conn.execute("INSERT INTO account_preferences(user_id,account_id,enabled,priority,switch_at) VALUES(1,1,0,255,20)",[]).unwrap();
+        init(&conn).unwrap();
+        conn.execute("INSERT INTO automatic_reset_attempts(cycle_digest,credit_digest,account_id,attempted_at,quota_snapshot,status) VALUES(zeroblob(32),zeroblob(32),1,0,'[]','unknown')",[]).unwrap();
+        // Reviewed rollback keeps the additive tables; re-upgrade must not erase the guard.
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        init(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM automatic_reset_attempts WHERE status='unknown'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT enabled,priority,switch_at FROM account_preferences",
+                [],
+                |r| Ok((
+                    r.get::<_, bool>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?
+                ))
+            )
+            .unwrap(),
+            (false, 255, 20)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT hex(encrypted_credentials) FROM oauth_accounts",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "1234"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
     #[test]
     fn routing_migration_preserves_saved_numbers_credentials_and_preferences() {
         let conn = Connection::open_in_memory().unwrap();
@@ -168,25 +226,34 @@ mod tests {
             .unwrap();
         init(&conn).unwrap();
         let preference = crate::account_preferences::effective(&conn, Some(1), 1).unwrap();
-        assert_eq!(preference.priority, -100);
         assert!(!preference.enabled);
         assert_eq!(
-            crate::account_preferences::effective(&conn, None, 1)
-                .unwrap()
-                .priority,
+            conn.query_row(
+                "SELECT priority FROM account_policy WHERE account_id=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
-            crate::account_preferences::effective(&conn, Some(1), 2)
-                .unwrap()
-                .priority,
+            conn.query_row(
+                "SELECT priority FROM account_policy WHERE account_id=2",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
             10
         );
-        assert_eq!(
+        assert!(
+            crate::account_preferences::effective(&conn, Some(1), 2)
+                .unwrap()
+                .locked
+        );
+        assert!(
             crate::account_preferences::effective(&conn, Some(1), 3)
                 .unwrap()
-                .priority,
-            1
+                .enabled
         );
         assert_eq!(
             conn.query_row(
