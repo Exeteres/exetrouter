@@ -26,7 +26,7 @@ Read the relevant contract before changing behavior: `docs/openai-api.md`, `docs
 ## Invariants
 
 - Never log or persist prompts, messages, generated content, tool arguments/results, request/response bodies, authorization headers or credentials. Errors must not echo arbitrary upstream payloads. Usage records contain model IDs and numeric counters; affinity stores keyed digests rather than content.
-- Preserve user-scoped context ownership and normal account affinity. Automatic quota failover may change the upstream account only with a complete current context; retain downstream WS/session identity, drop old account-specific turn state and preserve concurrent forks. Never migrate to bypass deactivation, authentication or operational backoff.
+- Preserve user-scoped context ownership and normal account affinity. Automatic quota failover or explicit account deactivation may change the upstream account only with a complete current context and an eligible replacement; retain downstream WS/session identity, drop old account-specific turn state and preserve concurrent forks. Never submit new work to a deactivated account or migrate to bypass authentication or operational backoff.
 - Unknown usage stays unknown, not zero. Keep durable accounting correct on interruption and restart.
 - Preserve bounded memory, queues, concurrency and tasks. Resource protection is separate from subscription limits; do not introduce request-frequency/IP quotas without a product requirement.
 - Preserve server-side identity resolution, Unix peer UID checks and private file permissions. Never grant the restricted SSH gateway Docker access, broad sudo access or a public HTTP management API.

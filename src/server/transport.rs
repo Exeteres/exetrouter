@@ -2304,23 +2304,48 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     json!(value.to_str().expect("validated turn state")),
                 );
             }
-            let mut migrated = false;
+            if binding
+                .as_ref()
+                .is_some_and(|binding| context.is_some_and(|id| id != binding.account.info.id))
+            {
+                if send_client(
+                    &mut client,
+                    ws_error(
+                        "context_account_mismatch",
+                        "opaque context belongs to a different account than this connection",
+                    ),
+                )
+                .await
+                .is_err()
+                {
+                    break 'frames;
+                }
+                continue 'frames;
+            }
             'migration: {
                 if let Some(bound) = &binding {
                     let id = bound.account.info.id;
-                    if upstream
-                        .account_enabled(identity.user_id, id)
-                        .await
-                        .unwrap_or(false)
-                        && (upstream.quota_exhausted(id).await.unwrap_or(false)
-                            || upstream
-                                .threshold_reached(identity.user_id, id)
-                                .await
-                                .unwrap_or(false)
-                            || upstream
-                                .routing_preempted(&model, identity.user_id, id)
-                                .await
-                                .unwrap_or(false))
+                    let disabled = match upstream.account_enabled(identity.user_id, id).await {
+                        Ok(enabled) => !enabled,
+                        Err(_) => {
+                            let _ = send_client(
+                                &mut client,
+                                ws_error("storage_unavailable", "account availability unavailable"),
+                            )
+                            .await;
+                            continue 'frames;
+                        }
+                    };
+                    if disabled
+                        || upstream.quota_exhausted(id).await.unwrap_or(false)
+                        || upstream
+                            .threshold_reached(identity.user_id, id)
+                            .await
+                            .unwrap_or(false)
+                        || upstream
+                            .routing_preempted(&model, identity.user_id, id)
+                            .await
+                            .unwrap_or(false)
                     {
                         if let Ok(account) = select_context_account(
                             &upstream,
@@ -2333,7 +2358,8 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                         .await
                         {
                             if account.info.id != id {
-                                let exhausted = upstream.quota_exhausted(id).await.unwrap_or(true);
+                                let required =
+                                    disabled || upstream.quota_exhausted(id).await.unwrap_or(true);
                                 let previous = payload
                                     .get("previous_response_id")
                                     .filter(|value| !value.is_null())
@@ -2348,10 +2374,10 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                 {
                                     // An automatic soft preference must not interrupt an
                                     // otherwise usable session without recovery history.
-                                    if !upstream.quota_exhausted(id).await.unwrap_or(true) {
+                                    if !required {
                                         break 'migration;
                                     }
-                                    let _ = send_client(&mut client, ws_error("context_recovery_unavailable", "quota exhausted; reconnect with the full current context to switch accounts")).await;
+                                    let _ = send_client(&mut client, ws_error("context_recovery_unavailable", "account unavailable; reconnect with the full current context to switch accounts")).await;
                                     continue 'frames;
                                 }
                                 // Keep only bounded routing metadata to restore a soft
@@ -2363,7 +2389,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                 let native_session =
                                     upstream_identity_session.as_deref().expect("bound session");
                                 let thread = upstream_thread.as_deref().expect("bound thread");
-                                let replacement = if exhausted {
+                                let replacement = if required {
                                     upstream
                                         .websocket_with_quota_fallback(
                                             account,
@@ -2421,11 +2447,10 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                             .expect("bound socket");
                                         old.close().await;
                                         frame_turn = None;
-                                        migrated = true;
                                         retired_accounts.insert(id);
                                     }
                                     Err(ref failure)
-                                        if !exhausted
+                                        if !required
                                             && !matches!(
                                                 failure,
                                                 crate::upstream::SocketError::Storage
@@ -2472,23 +2497,6 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                         }
                     }
                 }
-            }
-            if binding.as_ref().is_some_and(|binding| {
-                context.is_some_and(|id| id != binding.account.info.id) && !migrated
-            }) {
-                if send_client(
-                    &mut client,
-                    ws_error(
-                        "context_account_mismatch",
-                        "opaque context belongs to a different account than this connection",
-                    ),
-                )
-                .await
-                .is_err()
-                {
-                    break 'frames;
-                }
-                continue 'frames;
             }
             if binding.is_none() {
                 let selected = select_context_account(

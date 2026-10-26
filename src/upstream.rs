@@ -304,7 +304,15 @@ impl Upstream {
     pub async fn account_enabled(&self, user: i64, id: i64) -> crate::Result<bool> {
         self.db
             .call(move |conn| {
-                Ok(crate::account_preferences::effective(conn, Some(user), id)?.enabled)
+                // Only explicit deactivation permits this availability transfer;
+                // authentication failures and operational pauses are checked separately.
+                let disabled = conn.query_row(
+                    "SELECT state='disabled' FROM oauth_accounts WHERE id=?1",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok(!disabled
+                    && crate::account_preferences::effective(conn, Some(user), id)?.enabled)
             })
             .await
     }
@@ -338,9 +346,17 @@ impl Upstream {
         excluded: &[i64],
     ) -> std::result::Result<Selection, SelectError> {
         let cached_model = model.to_owned();
+        let cached_excluded = excluded.to_vec();
         let cached=self.db.call(move |conn| {
             let now=Utc::now().timestamp();
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM oauth_accounts a JOIN oauth_models m ON m.account_id=a.id WHERE a.state='active' AND m.model=?1 AND a.expires_at>?2+60 AND a.catalog_updated_at<=?2 AND a.catalog_updated_at>?2-60 AND (a.cooldown_until IS NULL OR a.cooldown_until<=?2) AND NOT EXISTS(SELECT 1 FROM oauth_health h WHERE h.account_id=a.id AND h.generation=a.generation AND h.retry_at>?2))",params![cached_model,now],|row|row.get::<_,bool>(0))?)
+            let mut stmt=conn.prepare("SELECT a.id FROM oauth_accounts a JOIN oauth_models m ON m.account_id=a.id WHERE a.state='active' AND m.model=?1 AND a.expires_at>?2+60 AND a.catalog_updated_at<=?2 AND a.catalog_updated_at>?2-60 AND (a.cooldown_until IS NULL OR a.cooldown_until<=?2) AND NOT EXISTS(SELECT 1 FROM oauth_health h WHERE h.account_id=a.id AND h.generation=a.generation AND h.retry_at>?2)")?;
+            for id in stmt.query_map(params![cached_model,now],|row|row.get::<_,i64>(0))? {
+                let id=id?;
+                if !cached_excluded.contains(&id) && crate::account_preferences::effective(conn,user,id)?.enabled {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }).await.map_err(|_|SelectError::UpstreamUnavailable)?;
         if !cached {
             let models = match self.models().await {
@@ -453,7 +469,6 @@ impl Upstream {
         Err(wait_error(retry))
     }
 
-    /// Only subscription exhaustion permits moving an owned conversation.
     /// Percentages alone do not block an account: credits may still permit it.
     pub(crate) async fn quota_exhausted(&self, id: i64) -> std::result::Result<bool, SelectError> {
         self.db
@@ -499,8 +514,14 @@ impl Upstream {
         let Some(id) = owner else {
             return self.select_for_user(model, affinity, Some(user)).await;
         };
-        if !self.account_enabled(user, id).await.unwrap_or(false) {
-            return Err(SelectError::UpstreamUnavailable);
+        if !self
+            .account_enabled(user, id)
+            .await
+            .map_err(|_| SelectError::UpstreamUnavailable)?
+        {
+            return self
+                .select_excluding(model, affinity, Some(user), &[id])
+                .await;
         }
         let pinned = self.select_pinned_for_user(model, id, Some(user)).await;
         let exhausted = self.quota_exhausted(id).await?;

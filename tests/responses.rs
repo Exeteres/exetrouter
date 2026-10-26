@@ -3292,8 +3292,27 @@ async fn pool_compaction_routes_http_and_new_ws_to_its_account_after_restart() {
         oauth::disable(conn,2)?; Ok(())
     }).await.unwrap();
     body.as_object_mut().unwrap().remove("type");
-    assert_eq!(fixture.post(body).await.status(), 503);
-    assert_eq!(fixture.rows().await.len(), 4);
+    let continued = fixture.post(body.clone()).await;
+    assert_eq!(continued.status(), 200);
+    assert_eq!(
+        continued.json::<Value>().await.unwrap()["status"],
+        "completed"
+    );
+    assert_eq!(
+        fixture.mock.requests.lock().unwrap().last().unwrap()["input"],
+        upstream_value(&body["input"])
+    );
+    assert_eq!(
+        fixture
+            .mock
+            .request_accounts
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "upstream-account"
+    );
+    assert_eq!(fixture.rows().await.len(), 5);
     let reply = fixture.post(request()).await;
     assert_eq!(reply.status(), 200);
     let _ = reply.text().await.unwrap();
@@ -3408,7 +3427,30 @@ async fn legacy_expired_context_survives_restart_on_every_response_transport() {
     let mut continuation = request();
     continuation["input"] = input;
     continuation["stream"] = json!(false);
+    continuation["conversation"] = json!({"id":conversation});
     assert_eq!(fixture.post(continuation.clone()).await.status(), 503);
+    assert_eq!(fixture.rows().await.len(), 8);
+    continuation.as_object_mut().unwrap().remove("conversation");
+    let continued = fixture.post(continuation.clone()).await;
+    assert_eq!(continued.status(), 200);
+    assert_eq!(
+        continued.json::<Value>().await.unwrap()["status"],
+        "completed"
+    );
+    assert_eq!(
+        fixture.mock.requests.lock().unwrap().last().unwrap()["input"],
+        upstream_value(&continuation["input"])
+    );
+    assert_eq!(
+        fixture
+            .mock
+            .request_accounts
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "upstream-account"
+    );
     let token = fixture.token_id.clone();
     fixture
         .db
@@ -3420,7 +3462,7 @@ async fn legacy_expired_context_survives_restart_on_every_response_transport() {
         .await
         .unwrap();
     assert_eq!(fixture.post(continuation).await.status(), 401);
-    assert_eq!(fixture.rows().await.len(), 8);
+    assert_eq!(fixture.rows().await.len(), 9);
     fixture.stop().await;
 }
 
@@ -4311,7 +4353,7 @@ async fn pool_ws_keeps_affinity_until_quota_then_recovers_on_another_account() {
         .unwrap();
     assert_eq!(
         terminal(&mut socket).await["error"]["code"],
-        "upstream_unavailable"
+        "account_disabled"
     );
     assert_eq!(fixture.mock.requests.lock().unwrap().len(), 4);
     fixture.stop().await;
@@ -4863,9 +4905,16 @@ async fn websocket_defers_idle_metadata_until_the_next_response_created() {
 
 #[tokio::test]
 async fn websocket_idle_recovery_rechecks_revocation_deactivation_and_backoff() {
-    for guard in ["revoked", "disabled", "backoff"] {
+    for guard in [
+        "revoked",
+        "disabled",
+        "disabled_without_alternative",
+        "backoff",
+    ] {
         let fixture = Fixture::start(false).await;
-        fixture.add_account(&["gpt-test"], false).await;
+        if guard != "disabled_without_alternative" {
+            fixture.add_account(&["gpt-test"], false).await;
+        }
         let mut socket = fixture.ws().await;
         let mut body = request();
         body["type"] = json!("response.create");
@@ -4880,7 +4929,7 @@ async fn websocket_idle_recovery_rechecks_revocation_deactivation_and_backoff() 
         fixture.db.call(move |conn| {
             match guard {
                 "revoked" => { exetrouter::revoke_token(conn, 1, &token)?; }
-                "disabled" => {
+                "disabled" | "disabled_without_alternative" => {
                     exetrouter::account_preferences::set_policy(conn, 1, Some(false), None, Some(true))?;
                 }
                 "backoff" => {
@@ -4897,19 +4946,28 @@ async fn websocket_idle_recovery_rechecks_revocation_deactivation_and_backoff() 
             .send(Message::Text(body.to_string().into()))
             .await
             .unwrap();
-        let expected = match guard {
-            "revoked" => "authentication_error",
-            "disabled" => "account_disabled",
-            _ => "upstream_backoff",
-        };
-        assert_eq!(
-            terminal(&mut socket).await["error"]["code"],
-            expected,
-            "{guard}"
-        );
-        assert_eq!(fixture.mock.requests.lock().unwrap().len(), 1);
-        assert_eq!(fixture.mock.handshakes.lock().unwrap().len(), 1);
-        assert_eq!(fixture.rows().await.len(), 1);
+        let result = terminal(&mut socket).await;
+        if guard == "disabled" {
+            assert_eq!(result["type"], "response.completed");
+            assert_eq!(
+                *fixture.mock.request_accounts.lock().unwrap(),
+                ["upstream-account", "upstream-account-2"]
+            );
+            assert!(fixture.mock.requests.lock().unwrap()[1]
+                .get("previous_response_id")
+                .is_none());
+        } else {
+            let expected = match guard {
+                "revoked" => "authentication_error",
+                "disabled_without_alternative" => "account_disabled",
+                _ => "upstream_backoff",
+            };
+            assert_eq!(result["error"]["code"], expected, "{guard}");
+        }
+        let count = if guard == "disabled" { 2 } else { 1 };
+        assert_eq!(fixture.mock.requests.lock().unwrap().len(), count);
+        assert_eq!(fixture.mock.handshakes.lock().unwrap().len(), count);
+        assert_eq!(fixture.rows().await.len(), count);
         fixture.stop().await;
     }
 }
@@ -5664,7 +5722,7 @@ async fn model_metadata_is_authenticated_persistent_and_conservative_across_acco
 }
 
 #[tokio::test]
-async fn account_preferences_route_by_user_and_operator_deactivation_blocks_bound_ws() {
+async fn account_preferences_route_by_user_and_operator_deactivation_moves_bound_ws() {
     let fixture = Fixture::start(false).await;
     let second = fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
@@ -5768,11 +5826,18 @@ async fn account_preferences_route_by_user_and_operator_deactivation_blocks_boun
         .send(Message::Text(value.to_string().into()))
         .await
         .unwrap();
+    assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+    assert_eq!(fixture.mock.requests.lock().unwrap().len(), before + 1);
     assert_eq!(
-        terminal(&mut socket).await["error"]["code"],
-        "account_disabled"
+        fixture
+            .mock
+            .request_accounts
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "upstream-account"
     );
-    assert_eq!(fixture.mock.requests.lock().unwrap().len(), before);
     assert_eq!(
         fixture
             .upstream
@@ -5784,6 +5849,267 @@ async fn account_preferences_route_by_user_and_operator_deactivation_blocks_boun
         1
     );
     fixture.stop().await;
+}
+
+async fn deactivate_first_account(fixture: &Fixture, mode: &'static str) {
+    fixture
+        .db
+        .call(move |conn| {
+            match mode {
+                "user" => {
+                    exetrouter::account_preferences::set_user(conn, 1, 1, Some(false), None)?;
+                }
+                "operator" => {
+                    exetrouter::account_preferences::set_policy(
+                        conn,
+                        1,
+                        Some(false),
+                        None,
+                        Some(true),
+                    )?;
+                }
+                "oauth" => {
+                    assert!(oauth::disable(conn, 1)?);
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deactivation_transfers_http_forks_compaction_and_reopened_context() {
+    for mode in ["user", "operator", "oauth"] {
+        let mut fixture = Fixture::start(false).await;
+        *fixture.mock.mode.lock().unwrap() = "turn_state".into();
+        let initial = fixture.compact(json!({"model":"gpt-test","input":[{"role":"user","content":"synthetic checkpoint"}]})).await;
+        assert_eq!(initial.status(), 200);
+        let turn = initial.headers()["x-codex-turn-state"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let checkpoint = initial.json::<Value>().await.unwrap()["output"][0].clone();
+        fixture.add_account(&["gpt-test"], false).await;
+        deactivate_first_account(&fixture, mode).await;
+        let mut body = request();
+        body["stream"] = json!(false);
+        body["test_mode"] = json!("native_proofs");
+        body["input"] = json!([checkpoint, {"role":"user","content":"synthetic continuation"}]);
+        body["client_metadata"] = json!({"x-codex-turn-state":turn});
+        let mut streaming = body.clone();
+        streaming["stream"] = json!(true);
+        let (a, b) = tokio::join!(fixture.post(body.clone()), fixture.post(streaming));
+        assert_eq!(a.status(), 200, "{mode}");
+        assert_eq!(b.status(), 200, "{mode}");
+        let output = a.json::<Value>().await.unwrap()["output"].clone();
+        let sse = b.text().await.unwrap();
+        assert!(sse.contains("response.completed") && sse.contains("exrtr1."));
+        assert!(output
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["encrypted_content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("exrtr1."))));
+        let compacted = fixture.compact(body.clone()).await;
+        assert_eq!(compacted.status(), 200);
+        assert_eq!(
+            compacted.json::<Value>().await.unwrap()["output"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture.mock.compactions.lock().unwrap()[1].0,
+            "upstream-account-2"
+        );
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend(output.as_array().unwrap().iter().cloned());
+        fixture.restart().await;
+        let resumed = fixture.post(body.clone()).await;
+        assert_eq!(resumed.status(), 200);
+        assert_eq!(
+            resumed.json::<Value>().await.unwrap()["status"],
+            "completed"
+        );
+        body["type"] = json!("response.create");
+        let mut socket = fixture.ws().await;
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+        socket.close(None).await.unwrap();
+        assert!(fixture
+            .mock
+            .request_accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| id == "upstream-account-2"));
+        assert!(fixture.mock.requests.lock().unwrap().iter().all(|request| {
+            request["input"][0] == upstream_value(&checkpoint)
+                && request
+                    .pointer("/client_metadata/x-codex-turn-state")
+                    .is_none()
+                && !request.to_string().contains("exrtr1.")
+        }));
+        assert!(fixture
+            .mock
+            .turn_states
+            .lock()
+            .unwrap()
+            .iter()
+            .all(Option::is_none));
+        let rows = fixture.rows().await;
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|row| row["status"] == "completed"));
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn deactivation_recovers_encrypted_tools_and_retires_turn_state_on_bound_ws() {
+    for mode in ["user", "operator", "oauth"] {
+        let fixture = Fixture::start(false).await;
+        *fixture.mock.mode.lock().unwrap() = "turn_state".into();
+        fixture.mock.tools.store(true, Ordering::SeqCst);
+        let mut body = request();
+        body["type"] = json!("response.create");
+        body["test_mode"] = json!("encrypted_tools");
+        body["tools"] =
+            json!([{"type":"function","name":"exec_command","parameters":{"type":"object"}}]);
+        let mut socket = fixture.ws().await;
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let mut turn = Value::Null;
+        let first = loop {
+            let event: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_ne!(event["type"], "error");
+            if event["type"] == "response.metadata" {
+                turn = event["headers"]["x-codex-turn-state"].clone();
+            }
+            if event["type"] == "response.completed" {
+                break event;
+            }
+        };
+        assert!(turn.is_string());
+        let call = first["response"]["output"][0].clone();
+        assert!(call["encrypted_function_args"].is_array());
+        fixture.add_account(&["gpt-test"], false).await;
+        deactivate_first_account(&fixture, mode).await;
+        body["previous_response_id"] = first["response"]["id"].clone();
+        body["client_metadata"] = json!({"x-codex-turn-state":turn});
+        body["input"] = json!([{"type":"function_call_output","call_id":call["call_id"],"output":"synthetic result"}]);
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let second = terminal(&mut socket).await;
+        assert_eq!(second["type"], "response.completed", "{mode}: {second}");
+        let requests = fixture.mock.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]["input"],
+            json!([
+                requests[0]["input"][0],
+                upstream_value(&call),
+                body["input"][0]
+            ])
+        );
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert!(requests[1]
+            .pointer("/client_metadata/x-codex-turn-state")
+            .is_none());
+        assert_eq!(
+            requests[0]["prompt_cache_key"],
+            requests[1]["prompt_cache_key"]
+        );
+        // A client may replay its original turn token on subsequent incremental turns.
+        body["previous_response_id"] = second["response"]["id"].clone();
+        body["input"] = json!([{"role":"user","content":"synthetic next"}]);
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+        socket.close(None).await.unwrap();
+        assert_eq!(
+            *fixture.mock.request_accounts.lock().unwrap(),
+            [
+                "upstream-account",
+                "upstream-account-2",
+                "upstream-account-2"
+            ]
+        );
+        let sessions = fixture.mock.sessions.lock().unwrap().clone();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].1, sessions[1].1);
+        let threads = fixture.mock.threads.lock().unwrap().clone();
+        assert_eq!(threads[0], threads[1]);
+        assert_eq!(fixture.rows().await.len(), 3);
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn deactivation_never_reuses_disabled_ws_when_replacement_is_unavailable() {
+    for guard in ["history", "handshake", "saved_conversation"] {
+        let fixture = Fixture::start(false).await;
+        let mut socket = fixture.ws().await;
+        let mut body = request();
+        body["type"] = json!("response.create");
+        if guard == "saved_conversation" {
+            body["test_mode"] = json!("saved_conversation");
+        }
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let first = terminal(&mut socket).await;
+        assert_eq!(first["type"], "response.completed");
+        if guard == "history" {
+            socket
+                .send(Message::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+        }
+        fixture.add_account(&["gpt-test"], false).await;
+        deactivate_first_account(&fixture, "user").await;
+        let before = fixture.rows().await.len();
+        body["previous_response_id"] = first["response"]["id"].clone();
+        if guard == "handshake" {
+            fixture.mock.reject_websocket.store(true, Ordering::SeqCst);
+        }
+        if guard == "saved_conversation" {
+            body["conversation"] = first["response"]["conversation"]["id"].clone();
+            assert!(body["conversation"].is_string());
+        }
+        socket
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+        let result = terminal(&mut socket).await;
+        let expected = match guard {
+            "history" => "context_recovery_unavailable",
+            "handshake" => "upstream_websocket_unavailable",
+            _ => "account_disabled",
+        };
+        assert_eq!(result["error"]["code"], expected, "{guard}");
+        assert_eq!(fixture.rows().await.len(), before);
+        assert_eq!(fixture.mock.requests.lock().unwrap().len(), before);
+        fixture.stop().await;
+    }
 }
 
 #[tokio::test]
