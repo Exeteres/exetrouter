@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.7.1
+
+- Replace the reserve label with a red `Priority` marker for enabled accounts with urgent routing deadlines.
+- Continue recoverable HTTP and WebSocket conversations on an eligible active account after personal, operator or standalone OAuth deactivation. Preserve encrypted history, tool results, concurrent forks and downstream session identity; discard old account-specific turn state.
+
 ## 0.7.0
 
 - Replace manual account priorities and switching rules with automatic deadline-aware routing. Use short-window subscriptions before weekly-only reserves, return recoverable sessions to restored short windows, and prioritize expiring credits/weekly refreshes within 72 hours. Use ordinary quota through exhaustion; strategic reset inventory never affects ranking.
