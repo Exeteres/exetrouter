@@ -1507,7 +1507,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) {
     }
     for (index, account) in accounts.into_iter().enumerate() {
         let label = format!(
-            "{}{} · {}{}",
+            "{}{}",
             render::safe(
                 account
                     .get("display_name")
@@ -1519,32 +1519,38 @@ fn overview(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) {
                 " · Deactivated"
             } else {
                 ""
-            },
-            render::account_routing(&account),
-            if account["preference"]["locked"].as_bool() == Some(true) {
-                " · Locked"
-            } else {
-                ""
             }
         );
-        let expiring = credit_expiring_soon(&account, chrono::Utc::now().timestamp());
-        let label = if expiring {
+        let mut label = vec![Span::raw(format!(
+            "{}{}",
+            if index == state.account_selected {
+                "▶ "
+            } else {
+                "  "
+            },
             label
-        } else {
-            format!("{label} · {}", credit_summary(&account))
-        };
+        ))];
+        let routing = render::account_routing(&account);
+        if let Some(reason) = routing.strip_prefix("Priority") {
+            label.push(Span::raw(" · "));
+            label.push(Span::styled(
+                "Priority",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+            label.push(Span::raw(reason.to_owned()));
+        } else if !routing.is_empty() {
+            label.push(Span::raw(format!(" · {routing}")));
+        }
+        if account["preference"]["locked"].as_bool() == Some(true) {
+            label.push(Span::raw(" · Locked"));
+        }
+        let expiring = credit_expiring_soon(&account, chrono::Utc::now().timestamp());
+        if !expiring {
+            label.push(Span::raw(format!(" · {}", credit_summary(&account))));
+        }
         if y >= inner.y as i32 && y < end {
             frame.render_widget(
-                Paragraph::new(format!(
-                    "{}{}",
-                    if index == state.account_selected {
-                        "▶ "
-                    } else {
-                        "  "
-                    },
-                    label
-                ))
-                .style(if index == state.account_selected {
+                Paragraph::new(Line::from(label)).style(if index == state.account_selected {
                     selection_style()
                 } else {
                     Style::default()
@@ -3826,7 +3832,15 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("Urgent"));
+        assert!(text.contains("Priority"));
+        let priority = terminal
+            .backend()
+            .buffer()
+            .content
+            .windows("Priority".len())
+            .find(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>() == "Priority")
+            .unwrap();
+        assert!(priority.iter().all(|cell| cell.fg == Color::Red));
         assert!(text.contains("auto reset: reset"));
         assert!(!text.contains("Use credit"));
     }

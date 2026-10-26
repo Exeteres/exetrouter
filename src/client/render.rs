@@ -286,7 +286,10 @@ pub(super) fn limits(v: &Value) -> String {
             )
         ));
         if account["preference"].is_object() {
-            text.push_str(&format!("  Routing: {}\n", account_routing(account),));
+            let routing = account_routing(account);
+            if !routing.is_empty() {
+                text.push_str(&format!("  Routing: {routing}\n"));
+            }
         }
         let q = &account["quota"];
         let windows = visible_windows(q);
@@ -360,10 +363,15 @@ pub(super) fn reset_credits(account: &Value) -> String {
 }
 pub(super) fn account_routing(account: &Value) -> String {
     let reason = match account["routing"]["reason"].as_str() {
-        Some("reset_expiring") => "Urgent · reset expiring",
-        Some("weekly_reset_soon") => "Urgent · weekly reset soon",
+        Some("reset_expiring" | "weekly_reset_soon")
+            if account["preference"]["enabled"].as_bool() == Some(false) =>
+        {
+            ""
+        }
+        Some("reset_expiring") => "Priority · reset expiring",
+        Some("weekly_reset_soon") => "Priority · weekly reset soon",
         Some("short_window_first") => "Short window first",
-        Some("reserve") => "Reserve",
+        Some("reserve") => "",
         _ => "Automatic · metadata unknown",
     };
     let status = account["automatic_reset"]["status"]
@@ -371,6 +379,8 @@ pub(super) fn account_routing(account: &Value) -> String {
         .unwrap_or("idle");
     if status == "idle" {
         reason.into()
+    } else if reason.is_empty() {
+        format!("auto reset: {}", safe(status))
     } else {
         format!("{reason} · auto reset: {}", safe(status))
     }
