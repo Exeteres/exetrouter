@@ -291,6 +291,14 @@ pub(super) fn limits(v: &Value) -> String {
                 text.push_str(&format!("  Routing: {routing}\n"));
             }
         }
+        if best_account(account, chrono::Utc::now().timestamp()) {
+            text.push_str("  Best candidate for new dialogs (model and affinity may differ)\n");
+        }
+        if let Some(count) = account["clients"]["count"].as_u64() {
+            text.push_str(&format!(
+                "  Clients: {count} recently active tokens (yours)\n"
+            ));
+        }
         let q = &account["quota"];
         let windows = visible_windows(q);
         if windows.is_empty() {
@@ -384,6 +392,112 @@ pub(super) fn account_routing(account: &Value) -> String {
     } else {
         format!("{reason} · auto reset: {}", safe(status))
     }
+}
+
+pub(super) fn best_account(account: &Value, now: i64) -> bool {
+    account["routing"]["best"] == true
+        && account["preference"]["enabled"] != false
+        && routing_current(account, now)
+}
+
+fn routing_current(account: &Value, now: i64) -> bool {
+    account["routing"]["observed_at"]
+        .as_i64()
+        .is_some_and(|at| crate::routing::fresh(at, now))
+        && account["routing"]["valid_until"]
+            .as_i64()
+            .is_none_or(|at| now < at)
+}
+
+pub(super) fn account_details(account: &Value, now: i64) -> String {
+    let label = account.get("display_name").unwrap_or(&account["label"]);
+    let mut text = format!("{}\n\n", safe(label.as_str().unwrap_or("Account")));
+    let fresh = routing_current(account, now);
+    if best_account(account, now) {
+        text.push_str("Best candidate for new dialogs\n");
+    }
+    let reason = match account["routing"]["reason"].as_str() {
+        Some("reset_expiring") => "Expiring reset credit",
+        Some("weekly_reset_soon") => "Weekly quota resets within 24 hours",
+        Some("short_window_first") => "Short-window capacity first",
+        Some("reserve") => "Weekly-only reserve",
+        _ => "Metadata unknown",
+    };
+    text.push_str(&format!(
+        "Routing: {reason}{}\n",
+        if fresh { "" } else { " (historical)" }
+    ));
+    if fresh {
+        if let Some(share) = account["routing"]["target_share_percent"].as_f64() {
+            text.push_str(&format!(
+                "Target share: {} (approximate)\n",
+                percent(&serde_json::json!(share))
+            ));
+        }
+    }
+    if let Some(deadline) = account["routing"]["deadline"].as_i64() {
+        text.push_str(&format!("Priority deadline: {}\n", date(&deadline.into())));
+    }
+    text.push('\n');
+    let Some(count) = account["clients"]["count"].as_u64() else {
+        text.push_str("Client activity unavailable on this server.");
+        return text;
+    };
+    text.push_str(&format!("Clients: {count} · your recently active tokens\n"));
+    if account["clients"]["observed_at"]
+        .as_i64()
+        .is_some_and(|at| !crate::routing::fresh(at, now))
+    {
+        text.push_str("Historical activity snapshot; refresh to update.\n");
+    }
+    if count == 0 {
+        text.push_str("No recent inference requests.\n");
+    }
+    for client in account["clients"]["rows"].as_array().into_iter().flatten() {
+        let name = safe(client["name"].as_str().unwrap_or("Label unavailable"));
+        let id = safe(client["id"].as_str().unwrap_or("Unknown token"));
+        let id = if id.len() > 20 {
+            format!(
+                "{}…{}",
+                id.chars().take(10).collect::<String>(),
+                id.chars()
+                    .rev()
+                    .take(4)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            )
+        } else {
+            id
+        };
+        let running = client["in_flight"].as_u64().unwrap_or(0);
+        text.push_str(&format!("\n{name} · {id}\n"));
+        if running > 0 {
+            text.push_str(&format!("Running: {running} · "));
+        }
+        let age = client["last_request_at"]
+            .as_i64()
+            .filter(|at| *at <= now)
+            .map(|at| {
+                let seconds = now - at;
+                if seconds < 60 {
+                    format!("{seconds}s ago")
+                } else {
+                    format!("{}m ago", seconds / 60)
+                }
+            })
+            .unwrap_or_else(|| "Unknown".into());
+        text.push_str(&format!(
+            "Last request: {age} · {}\n",
+            date(&client["last_request_at"])
+        ));
+    }
+    if account["clients"]["truncated"] == true {
+        text.push_str("\nShowing at most 128 tokens, running requests first.\n");
+    }
+    text.push_str("\nTokens disappear after 15 minutes without requests; running requests remain visible.\nOne token may represent multiple apps or appear on multiple accounts.\n\nModel availability and existing dialog affinity may change selection.\nWeights use percentages, not calibrated capacity across plans.");
+    text
 }
 
 pub(super) fn accounts(value: &Value) -> String {

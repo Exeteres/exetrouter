@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Distribute new independent dialogs within each eligible routing tier using remaining weekly quota and time until reset. Concentrate weekly quota in its final 24 hours; retain the separate 72-hour expiring-reset priority, short-window reserves and owned-dialog affinity.
+- Show a green `Best` routing recommendation and per-account `Clients` counts. Account details list only the current user's recent API tokens, locally decrypted labels, running requests and last-request times; idle tokens disappear after 15 minutes without changing session ownership or usage history.
+
 ## 0.7.1
 
 - Replace the reserve label with a red `Priority` marker for enabled accounts with urgent routing deadlines.

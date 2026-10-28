@@ -15,6 +15,9 @@ pub struct Decision {
     pub expiring_resets: Option<usize>,
     pub next_credit_expiry: Option<i64>,
     pub switch_at: u8,
+    /// Percentage points per day, not absolute capacity across different plans.
+    #[serde(default)]
+    pub pacing_weight: Option<f64>,
 }
 
 pub(crate) fn fresh(at: i64, now: i64) -> bool {
@@ -44,12 +47,13 @@ pub(crate) fn decide(
                 .filter(|at| *at > now)
                 .min()
         });
-    let free = weekly(quota)
+    let weekly = weekly(quota).filter(|w| fresh(w.observed_at, now));
+    let free = weekly
         .filter(|w| w.remaining_percent > 0.0)
         .and_then(|w| w.reset_at)
         .filter(|at| *at > now);
     let credit_deadline = expiry.filter(|at| *at <= now.saturating_add(3 * DAY));
-    let weekly_deadline = free.filter(|at| *at <= now.saturating_add(3 * DAY));
+    let weekly_deadline = free.filter(|at| *at <= now.saturating_add(DAY));
     let deadline = credit_deadline.into_iter().chain(weekly_deadline).min();
     let urgent = deadline.is_some();
     Decision {
@@ -83,6 +87,14 @@ pub(crate) fn decide(
         }),
         next_credit_expiry: credit_deadline,
         switch_at: 0,
+        pacing_weight: if !urgent && quota.status == "observed" {
+            weekly.zip(free).and_then(|(window, reset)| {
+                let weight = window.remaining_percent / ((reset - now) as f64 / DAY as f64);
+                (weight.is_finite() && weight > 0.0).then_some(weight)
+            })
+        } else {
+            None
+        },
     }
 }
 
@@ -217,9 +229,9 @@ mod tests {
     #[test]
     fn urgency_uses_credit_expiry_or_weekly_refresh_not_short_window_reset() {
         let now = 1_800_000_000;
-        let mut q = quota(now, now + 3 * DAY + 1);
+        let mut q = quota(now, now + DAY + 1);
         assert!(!decide(&q, Some(true), None, now).urgent);
-        q.windows[0].reset_at = Some(now + 3 * DAY);
+        q.windows[0].reset_at = Some(now + DAY);
         let decision = decide(&q, Some(false), None, now);
         assert!(decision.urgent);
         assert_eq!(decision.switch_at, 0);
@@ -233,6 +245,23 @@ mod tests {
         credits.observed_at = now - 60;
         assert!(!decide(&q, Some(false), Some(&credits), now).urgent);
         assert_eq!(decide(&q, None, Some(&credits), now).expiring_resets, None);
+    }
+    #[test]
+    fn pacing_uses_fresh_remaining_weekly_quota_without_changing_session_tiers() {
+        let now = 1_800_000_000;
+        let a = decide(&quota(now, now + 5 * DAY), Some(true), None, now);
+        let b = decide(&quota(now, now + 2 * DAY), Some(true), None, now);
+        assert_eq!(a.pacing_weight, Some(10.0));
+        assert_eq!(b.pacing_weight, Some(25.0));
+        assert_eq!(a.compare(&b), Ordering::Equal);
+        assert!(!b.urgent);
+        let mut stale = quota(now - 60, now + 2 * DAY);
+        assert_eq!(decide(&stale, Some(true), None, now).pacing_weight, None);
+        stale.windows[0].remaining_percent = 0.0;
+        assert_eq!(decide(&stale, Some(true), None, now).pacing_weight, None);
+        let mut depleted = quota(now, now + 2 * DAY);
+        depleted.windows[0].remaining_percent = 0.0;
+        assert_eq!(decide(&depleted, Some(true), None, now).pacing_weight, None);
     }
     #[test]
     fn metadata_is_fenced_by_generation_order_and_freshness() {
