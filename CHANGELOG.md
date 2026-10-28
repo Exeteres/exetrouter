@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1
 
 - Make account `Clients` counts and activity lists server-wide. Keep the 15-minute idle window, running-request visibility and bounded lists; expose other users' clients only through stable keyed aliases, never private names or raw token/user identities. Keep `Best` and target shares identical for every viewer of the same server snapshot.
 - Remove personal account activation and custom account labels from the dashboard, CLI and management protocol. Ignore retired personal availability records; preserve operator account controls, encrypted token names and dashboard preferences without a schema change.
