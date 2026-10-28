@@ -695,7 +695,10 @@ fn configured_events(
     };
     if matches!(
         mode,
-        "native_proofs" | "quota_proofs_after_tool" | "quota_http_proofs_after_tool"
+        "native_proofs"
+            | "native_proofs_exhausted"
+            | "quota_proofs_after_tool"
+            | "quota_http_proofs_after_tool"
     ) && body["generate"] != false
         && !is_compaction(body)
     {
@@ -712,7 +715,7 @@ fn configured_events(
                     .as_array_mut()
                     .unwrap()
                     .insert(0, reasoning.clone());
-                if tool_turn && mode == "native_proofs" {
+                if tool_turn && matches!(mode, "native_proofs" | "native_proofs_exhausted") {
                     event["response"]["usage"]["input_tokens"] = json!(50000);
                     event["response"]["usage"]["total_tokens"] = json!(50002);
                 }
@@ -726,6 +729,11 @@ fn configured_events(
             2,
             json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
         );
+        if tool_turn && mode == "native_proofs_exhausted" {
+            events.insert(1, json!({"type":"codex.rate_limits","rate_limits":{"primary":{
+                "used_percent":100,"window_minutes":300,"reset_at":chrono::Utc::now().timestamp()+300
+            }}}));
+        }
     }
     if mode == "encrypted_tools" {
         for event in &mut events {

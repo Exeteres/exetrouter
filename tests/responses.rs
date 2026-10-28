@@ -7172,6 +7172,179 @@ async fn opencode_v1_http_compatibility_probe() {
     check_opencode_v1_http("opencode-v1").await;
 }
 
+#[tokio::test]
+#[ignore = "requires OpenCode V1 1.18.30; isolated synthetic upstream only"]
+async fn opencode_v1_retains_transfer_receipts_after_tool_and_process_restart() {
+    let binary = std::env::var("EXETROUTER_OPENCODE_V1_BIN").unwrap();
+    native::version(&binary, "1.18.30").await.unwrap();
+    let mut fixture = Fixture::start(false).await;
+    fixture.add_account(&["gpt-test"], false).await;
+    fixture.first_profile(&["gpt-test"], "quota_http_proofs_after_tool");
+    fixture
+        .mock
+        .accounts
+        .lock()
+        .unwrap()
+        .get_mut("upstream-account-2")
+        .unwrap()
+        .mode = "native_proofs".into();
+    observe_expiring_reset(&fixture, 1).await;
+    fixture.mock.tools.store(true, Ordering::SeqCst);
+    let probe = probe::Probe::bounded(&fixture.url, 20).await.unwrap();
+    for resume in [false, true] {
+        let output = native::Run {
+            binary: &binary,
+            client: "opencode-v1",
+            url: &probe.url,
+            model: "gpt-test",
+            bearer: &fixture.secret,
+            websocket: false,
+            directory: fixture.dir.path(),
+            prompt: "Run the local compatibility fixture and report the result.",
+        }
+        .continued(&native::Continuation {
+            token_limit: 40000,
+            resume,
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("EXETROUTER_SMOKE_OK"),
+            "resume={resume}: diagnostic={} metadata={}",
+            native::diagnostic(&output.stdout),
+            probe.observed.lock().unwrap().metadata(),
+        );
+        assert_eq!(native::diagnostic(&output.stdout)["error_events"], 0);
+        if !resume {
+            assert!(native::tool_result(&output.stdout));
+            fixture.restart().await;
+        }
+    }
+    let calls = fixture.mock.requests.lock().unwrap().clone();
+    for prefix in [
+        "synthetic-native-proof-upstream-account-resp_",
+        "synthetic-native-proof-upstream-account-2-resp_",
+    ] {
+        assert!(calls.last().unwrap()["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["encrypted_content"]
+                .as_str()
+                .is_some_and(|value| value.starts_with(prefix))));
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires OpenCode V1 1.18.30; isolated synthetic upstream only"]
+async fn opencode_v1_compaction_preserves_tail_across_independent_summary_account() {
+    let binary = std::env::var("EXETROUTER_OPENCODE_V1_BIN").unwrap();
+    native::version(&binary, "1.18.30").await.unwrap();
+    let mut fixture = Fixture::start(false).await;
+    fixture.add_account(&["gpt-test"], false).await;
+    fixture.first_profile(&["gpt-test"], "native_proofs_exhausted");
+    fixture
+        .mock
+        .accounts
+        .lock()
+        .unwrap()
+        .get_mut("upstream-account-2")
+        .unwrap()
+        .mode = "native_proofs".into();
+    observe_expiring_reset(&fixture, 1).await;
+    fixture.mock.tools.store(true, Ordering::SeqCst);
+    let probe = probe::Probe::bounded(&fixture.url, 16).await.unwrap();
+    // Exceed V1's preserved-tail estimate so it summarizes the user message but
+    // retains the following assistant/tool turn with its account-owned reasoning.
+    let prompt = format!(
+        "Run the local compatibility fixture and report the result. {}",
+        "synthetic history ".repeat(10000)
+    );
+    for step in 0..3 {
+        let output = native::Run {
+            binary: &binary,
+            client: "opencode-v1",
+            url: &probe.url,
+            model: "gpt-test",
+            bearer: &fixture.secret,
+            websocket: false,
+            directory: fixture.dir.path(),
+            prompt: if step == 0 {
+                &prompt
+            } else {
+                "Continue the local compatibility fixture."
+            },
+        }
+        .continued(&native::Continuation {
+            token_limit: 40000,
+            resume: step != 0,
+        })
+        .await
+        .unwrap();
+        let diagnostic = native::diagnostic(&output.stdout);
+        if step == 0 {
+            // Reproduce the actual V1 failure, then repair that saved session
+            // through the request-copy hook, without rewriting its database.
+            assert!(String::from_utf8_lossy(&output.stdout).contains("context_account_mismatch"));
+            assert_eq!(diagnostic["error_events"], 1);
+            assert_eq!(fixture.mock.requests.lock().unwrap().len(), 2);
+            let plugins = fixture.dir.path().join("client-config/plugins");
+            std::fs::create_dir_all(&plugins).unwrap();
+            std::fs::write(
+                plugins.join("exetrouter-context.js"),
+                include_str!("../clients/opencode-v1/context.js"),
+            )
+            .unwrap();
+        } else {
+            assert!(
+                output.status.success() && diagnostic["smoke_marker"] == true,
+                "step={step} diagnostic={diagnostic} metadata={}",
+                probe.observed.lock().unwrap().metadata()
+            );
+            assert_eq!(diagnostic["error_events"], 0);
+        }
+        if step < 2 {
+            fixture.restart().await;
+        }
+    }
+    let calls = fixture.mock.requests.lock().unwrap().clone();
+    let accounts = fixture.mock.request_accounts.lock().unwrap().clone();
+    assert_eq!(calls.len(), 4);
+    assert!(calls[1]["tools"].is_null(), "independent plaintext summary");
+    for call in &calls[2..] {
+        let input = call["input"].as_array().unwrap();
+        assert!(input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
+        assert!(input
+            .iter()
+            .any(|item| item["encrypted_content"]
+                == "synthetic-native-proof-upstream-account-resp_1"));
+        assert!(!input
+            .iter()
+            .any(|item| item["encrypted_content"]
+                == "synthetic-native-proof-upstream-account-2-resp_2"));
+    }
+    assert!(
+        calls[3]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["encrypted_content"]
+                == format!("synthetic-native-proof-{}-resp_3", accounts[2])),
+        "ordinary reasoning is preserved on reopen"
+    );
+    assert_eq!(&accounts[..2], ["upstream-account", "upstream-account-2"]);
+    assert_eq!(
+        accounts[2], accounts[3],
+        "owned continuation keeps affinity"
+    );
+    assert_eq!(fixture.rows().await.len(), 4, "400 never submits inference");
+    fixture.stop().await;
+}
+
 async fn check_opencode_v1_http(client: &str) {
     let binary = std::env::var("EXETROUTER_OPENCODE_V1_BIN").unwrap();
     native::version(&binary, &native::reviewed_version("opencode-v1"))

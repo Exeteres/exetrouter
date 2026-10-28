@@ -197,8 +197,6 @@ impl Run<'_> {
                 command.arg(self.prompt);
             }
             "opencode-v1" => {
-                // V1 continuation checks process reopening only. Its summarizing
-                // compaction protocol is not part of this fixture.
                 if self.websocket {
                     return Err("OpenCode V1 fixture only supports HTTP".into());
                 }
@@ -210,6 +208,17 @@ impl Run<'_> {
                 options["provider"][provider]["options"]["baseURL"] =
                     json!(format!("{}/v1", self.url));
                 options["permission"] = json!({"*":"allow"});
+                if let Some(policy) = policy {
+                    let window = options["provider"][provider]["models"][self.model]["limit"]
+                        ["input"]
+                        .as_u64()
+                        .ok_or("OpenCode V1 input limit unavailable")?;
+                    if policy.token_limit >= window {
+                        return Err("test compaction threshold exceeds input limit".into());
+                    }
+                    options["compaction"] = json!({"auto":true,"reserved":window-policy.token_limit,
+                        "preserve_recent_tokens":10000,"tail_turns":1});
+                }
                 command
                     .env("XDG_CONFIG_HOME", &config)
                     .env("XDG_DATA_HOME", self.directory.join("data"))
