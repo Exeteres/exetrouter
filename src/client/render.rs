@@ -370,8 +370,7 @@ pub(super) fn account_routing(account: &Value) -> String {
         }
         Some("reset_expiring") => "Priority · reset expiring",
         Some("weekly_reset_soon") => "Priority · weekly reset soon",
-        Some("short_window_first") => "Short window first",
-        Some("reserve") => "",
+        Some("short_window_first" | "reserve") => "",
         _ => "Automatic · metadata unknown",
     };
     let status = account["automatic_reset"]["status"]
