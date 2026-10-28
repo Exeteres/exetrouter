@@ -9,6 +9,8 @@
 - Negotiate upstream WebSocket `permessage-deflate` using the exact transport revisions pinned by Codex 0.164.0. Preserve plain fragmentation when declined and retain decoded upstream event bounds; do not replay a rejected inference.
 - Select upstream HTTP SSE before submitting complete generation requests of at least 16 MiB, preserving the client's WebSocket, account affinity and full input. Recover HTTP continuations from the bounded latest window or request client-controlled full-context recovery before inference; never replay a WS size rejection or turn native warmup into generation.
 - Compress large completed continuation windows in transient memory so HTTP-backed WebSockets can continue tool deltas without requiring full client reconstruction every turn. Keep the retained per-window/global budgets, bound decoded recovery separately, and preserve exact opaque/tool history, account checks and unknown usage.
+- Distribute new independent dialogs within each eligible routing tier using remaining weekly quota and time until reset. Concentrate weekly quota in its final 24 hours; retain the separate 72-hour expiring-reset priority, short-window reserves and owned-dialog affinity.
+- Show a green `Best` routing recommendation and per-account `Clients` counts. Account details list only the current user's recent API tokens, locally decrypted labels, running requests and last-request times; idle tokens disappear after 15 minutes without changing session ownership or usage history.
 
 ## 0.7.1
 

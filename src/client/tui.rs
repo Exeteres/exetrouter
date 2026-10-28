@@ -276,6 +276,10 @@ struct State {
     update_checked: bool,
 }
 enum Modal {
+    Account {
+        id: i64,
+        scroll: u16,
+    },
     Actions {
         title: String,
         entries: Vec<(String, KeyCode)>,
@@ -754,6 +758,16 @@ fn selected_model_id(state: &State) -> Option<&str> {
         .and_then(|row| row["id"].as_str())
         .filter(|id| !id.is_empty() && !id.chars().any(char::is_control))
 }
+fn account_detail_text(state: &State, id: i64) -> String {
+    state.values[OVERVIEW]
+        .as_ref()
+        .and_then(|value| value["quota_accounts"].as_array())
+        .and_then(|rows| rows.iter().find(|row| row["id"].as_i64() == Some(id)))
+        .map_or_else(
+            || "Account unavailable. Refresh Overview.".into(),
+            |row| render::account_details(row, chrono::Utc::now().timestamp()),
+        )
+}
 fn action_menu(state: &State, _connection: &Connection) -> (String, Vec<(String, KeyCode)>) {
     let entries = match state.tab {
         OVERVIEW => {
@@ -1148,6 +1162,11 @@ fn render_hits(
 
     if let Some(modal) = &state.modal {
         footer = vec![match modal {
+            Modal::Account { .. } => keys(&[
+                ("↑ / ↓", "scroll"),
+                ("PgUp / PgDn", "page"),
+                ("r", "refresh"),
+            ]),
             Modal::Actions { .. } => keys(&[("↑ / ↓", "select")]),
             Modal::Personal { .. } | Modal::Rename { .. } => {
                 keys(&[("← / →", "cursor"), ("Ctrl-U", "clear")])
@@ -1265,6 +1284,7 @@ fn render_hits(
     if let Some(modal) = &state.modal {
         hits.clear();
         let (title,text) = match modal {
+            Modal::Account { id, .. } => ("Account details", account_detail_text(state,*id)),
             Modal::Actions { title, entries, selected } => (title.as_str(), entries.iter().enumerate().map(|(i,(name,key))|format!("{}{} {}",if i==*selected {"▶ "}else{"  "},name,shortcut_label(*key))).collect::<Vec<_>>().join("\n")),
             Modal::Error { title, message } => (*title, message.clone()),
             Modal::UpdateConfirm => ("Update exr", "Install the latest published release in the existing installation?\nThe installation method is preserved; config, accounts and tokens stay in place.\nSource builds may take several minutes. Restart exr after completion.".into()),
@@ -1276,7 +1296,11 @@ fn render_hits(
             Modal::ClipboardRetry { .. } => ("Clipboard unavailable", "The token was issued, but copying failed.\nThe secret stays hidden. No token request will be repeated.\nDiscarding it requires rotating the token later.".into()),
             Modal::Help => ("Keyboard help", keyboard_help(state, connection)),
         };
-        let mut area = popup(frame.area());
+        let mut area = if matches!(modal, Modal::Account { .. }) {
+            account_popup(frame.area())
+        } else {
+            popup(frame.area())
+        };
         let needed = Paragraph::new(styled_text(&text))
             .wrap(Wrap { trim: false })
             .line_count(area.width.saturating_sub(2))
@@ -1290,21 +1314,37 @@ fn render_hits(
         if error {
             title.spans[1].style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
         }
-        frame.render_widget(
-            Paragraph::new(styled_text(&text))
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(if error { Color::Red } else { Color::Cyan }));
+        if let Modal::Account { scroll, .. } = modal {
+            frame.render_widget(block, area);
+            let content = Rect::new(
+                area.x + 1,
+                area.y + 1,
+                area.width.saturating_sub(2),
+                area.height.saturating_sub(4),
+            );
+            let max = Paragraph::new(styled_text(&text))
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(title)
-                        .border_style(Style::default().fg(if error {
-                            Color::Red
-                        } else {
-                            Color::Cyan
-                        })),
-                ),
-            area,
-        );
+                .line_count(content.width)
+                .saturating_sub(content.height as usize)
+                .min(u16::MAX as usize) as u16;
+            frame.render_widget(
+                Paragraph::new(styled_text(&text))
+                    .wrap(Wrap { trim: false })
+                    .scroll(((*scroll).min(max), 0)),
+                content,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(styled_text(&text))
+                    .wrap(Wrap { trim: false })
+                    .block(block),
+                area,
+            );
+        }
         match modal {
             Modal::Actions { entries, .. } => {
                 let mut y = area.y + 1;
@@ -1334,6 +1374,7 @@ fn render_hits(
             _ => {}
         }
         let controls: &[(&str, KeyCode)] = match modal {
+            Modal::Account { .. } => &[("Actions", KeyCode::Enter), ("Close", KeyCode::Esc)],
             Modal::Confirm { rotate: true, .. } => &[
                 ("Rotate token", KeyCode::Char('y')),
                 ("Cancel", KeyCode::Esc),
@@ -1531,6 +1572,24 @@ fn overview(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) {
             label
         ))];
         let routing = render::account_routing(&account);
+        if render::best_account(&account, chrono::Utc::now().timestamp()) {
+            label.push(Span::raw(" · "));
+            label.push(Span::styled(
+                "Best",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(count) = account["clients"]["count"].as_u64() {
+            let stale = account["clients"]["observed_at"]
+                .as_i64()
+                .is_some_and(|at| !crate::routing::fresh(at, chrono::Utc::now().timestamp()));
+            label.push(Span::raw(format!(
+                " · Clients: {count}{}",
+                if stale { " (historical)" } else { "" }
+            )));
+        }
         if let Some(reason) = routing.strip_prefix("Priority") {
             label.push(Span::raw(" · "));
             label.push(Span::styled(
@@ -1909,7 +1968,7 @@ fn usage_chart(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) 
 }
 fn keyboard_help(state: &State, connection: &Connection) -> String {
     let actions = match state.tab {
-        OVERVIEW => "↑/↓: select account\nPgUp/PgDn: page\nEnter: account actions\nD: toggle activation; L: personal label\nRouting and expiring reset credits are automatic. Operator activation locks apply.",
+        OVERVIEW => "↑/↓: select account\nPgUp/PgDn: page\nEnter: account actions, routing details and clients\nD: toggle activation; L: personal label\nRouting and expiring reset credits are automatic. Operator activation locks apply.",
         USAGE if state.group == 0 => "p: change period\nb: change grouping\nm: switch tokens / requests",
         USAGE => "↑/↓: select user, model or token with recorded usage\np: change period\nb: change grouping\nm: switch tokens / requests",
         TOKENS => "↑/↓: select token\nEnter: token actions\nn: create; l: rename; o: rotate; x: revoke\nRotation and revocation require confirmation.",
@@ -1929,6 +1988,12 @@ fn popup(area: Rect) -> Rect {
         width,
         height,
     )
+}
+fn account_popup(area: Rect) -> Rect {
+    let mut result = popup(area);
+    result.height = area.height.saturating_sub(6).min(36);
+    result.y = area.y + (area.height - result.height) / 2;
+    result
 }
 pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Result<()> {
     let mut args = Session {
@@ -2056,7 +2121,7 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
         }
         if state.tab == OVERVIEW
             && pending.is_none()
-            && state.modal.is_none()
+            && (state.modal.is_none() || matches!(state.modal,Some(Modal::Account{..})))
             && Instant::now() >= next_limits_refresh
         {
             pending = Some(start(
@@ -2142,6 +2207,29 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
         let mut mutation = None;
         if let Some(modal) = &mut state.modal {
             match modal {
+                Modal::Account { id, scroll } => match key.code {
+                    KeyCode::Esc => state.modal = None,
+                    KeyCode::Enter => {
+                        let account=*id;
+                        if let Some(index)=state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|rows|rows.iter().position(|r|r["id"].as_i64()==Some(account))) {
+                            state.account_selected=index;
+                            let (title,entries)=action_menu(&state,&args.connection);
+                            state.modal=Some(Modal::Actions{title,entries,selected:0});
+                        } else {state.modal=None;}
+                    }
+                    KeyCode::Down | KeyCode::PageDown => {
+                        let step=if key.code==KeyCode::PageDown {10} else {1};
+                        let account=*id;
+                        let next=scroll.saturating_add(step);
+                        let size=terminal.size()?;
+                        let area=account_popup(Rect::new(0,0,size.width,size.height));
+                        let max=Paragraph::new(account_detail_text(&state,account)).wrap(Wrap{trim:false}).line_count(area.width.saturating_sub(2)).saturating_sub(area.height.saturating_sub(4) as usize).min(u16::MAX as usize) as u16;
+                        state.modal=Some(Modal::Account{id:account,scroll:next.min(max)});
+                    }
+                    KeyCode::Up | KeyCode::PageUp => *scroll=scroll.saturating_sub(if key.code==KeyCode::PageUp {10} else {1}),
+                    KeyCode::Char('r') if pending.is_none() => pending=Some(start(&args.connection,ControlRequest::Limits,OVERVIEW,false)),
+                    _ => {}
+                },
                 Modal::Actions { .. } => unreachable!("action menus handled above"),
                 Modal::Error { .. } => {
                     if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
@@ -2404,8 +2492,14 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                     pending = Some(start(&args.connection, request(&state), state.tab, false))
                 }
                 KeyCode::Enter if matches!(state.tab,OVERVIEW|TOKENS) => {
-                    let (title, entries)=action_menu(&state,&args.connection);
-                    if entries.is_empty() { state.modal=Some(Modal::Error{title:"Account unavailable",message:format!("{title}\n\nThis account is deactivated and locked by the server operator.")}); } else { state.modal=Some(Modal::Actions{title,entries,selected:0}); }
+                    if state.tab==OVERVIEW {
+                        if let Some(id)=state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|rows|rows.get(state.account_selected)).and_then(|row|row["id"].as_i64()) {
+                            state.modal=Some(Modal::Account{id,scroll:0});
+                        }
+                    } else {
+                        let (title,entries)=action_menu(&state,&args.connection);
+                        state.modal=Some(Modal::Actions{title,entries,selected:0});
+                    }
                 }
                 KeyCode::Char('D') if state.tab == OVERVIEW => {
                     if let Some(row)=state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|r|r.get(state.account_selected)) {
@@ -3730,6 +3824,58 @@ mod tests {
         state.values[MODELS] = Some(serde_json::json!({"data":[]}));
         select_item(&mut state, true, 10, 66);
         assert_eq!(selected_model_id(&state), None);
+    }
+    #[test]
+    fn best_clients_and_scrollable_account_details_are_visible() {
+        let now = chrono::Utc::now().timestamp();
+        let mut terminal = Terminal::new(TestBackend::new(72, 20)).unwrap();
+        let mut state = State::default();
+        state.values[OVERVIEW] = Some(serde_json::json!({"quota_accounts":[{
+            "id":1,"label":"Synthetic","preference":{"enabled":true},
+            "routing":{"best":true,"observed_at":now,"reason":"weekly_reset_soon","target_share_percent":100.0},
+            "quota":{"windows":[]},"clients":{"count":1,"observed_at":now,"rows":[{"id":"tok_synthetic","name":"Laptop - Codex","last_request_at":now-12,"in_flight":1}]}
+        }]}));
+        terminal
+            .draw(|f| render(f, &state, &Connection::default(), false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Best"));
+        assert!(text.contains("Clients: 1"));
+        let badge = buffer
+            .content
+            .windows(4)
+            .find(|cells| cells.iter().map(|c| c.symbol()).collect::<String>() == "Best")
+            .unwrap();
+        assert!(badge.iter().all(|c| c.fg == Color::Green));
+        let details = account_detail_text(&state, 1);
+        assert!(details.contains("Laptop - Codex"));
+        assert!(details.contains("12s ago"));
+        assert!(details.contains("Running: 1"));
+        state.modal = Some(Modal::Account { id: 1, scroll: 7 });
+        terminal
+            .draw(|f| render(f, &state, &Connection::default(), false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Account details"));
+        assert!(text.contains("Laptop - Codex"));
+        assert!(text.contains("Actions Enter"));
+        state.values[OVERVIEW].as_mut().unwrap()["quota_accounts"][0]["routing"]["observed_at"] =
+            (now - 60).into();
+        assert!(!render::best_account(
+            &state.values[OVERVIEW].as_ref().unwrap()["quota_accounts"][0],
+            now
+        ));
     }
     #[test]
     fn mode_badges_use_the_requested_backgrounds_and_header_keeps_version() {

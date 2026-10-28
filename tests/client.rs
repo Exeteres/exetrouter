@@ -495,6 +495,13 @@ fn real_terminal_dashboard_copies_secrets_without_rendering_and_restores_screen(
     }
     clear_history(&mut output);
     master.write_all(b"\r").unwrap();
+    wait(&mut master, &mut output, "Account details");
+    wait(
+        &mut master,
+        &mut output,
+        "Client activity unavailable on this server.",
+    );
+    master.write_all(b"\r").unwrap();
     wait(&mut master, &mut output, "Deactivate for me");
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()

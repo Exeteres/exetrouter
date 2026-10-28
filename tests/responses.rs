@@ -7398,6 +7398,117 @@ async fn configure_soft_threshold(fixture: &Fixture, account: i64, used: f64, ag
     }).await.unwrap();
 }
 
+async fn configure_weekly_pacing(fixture: &Fixture) {
+    for (account, used, days) in [(1, 40.0, 6), (2, 20.0, 4)] {
+        configure_soft_threshold(fixture, account, 10.0, 0).await;
+        fixture.db.call(move|conn| {
+            let now=chrono::Utc::now().timestamp();
+            conn.execute("UPDATE account_routing_metadata SET short_window=1 WHERE account_id=?1",[account])?;
+            conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(?1,'secondary',?2,10080,?3,?4,0) ON CONFLICT(account_id,kind) DO UPDATE SET used_percent=excluded.used_percent,window_minutes=excluded.window_minutes,reset_at=excluded.reset_at,observed_at=excluded.observed_at",rusqlite::params![account,used,now+days*86400,now])?;
+            Ok(())
+        }).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn weekly_pacing_distributes_new_sessions_and_urgent_short_exhaustion_uses_other_capacity() {
+    let fixture = Fixture::start(false).await;
+    fixture.add_account(&["gpt-test"], false).await;
+    fixture.upstream.models().await.unwrap();
+    configure_weekly_pacing(&fixture).await;
+    let mut second = 0;
+    for i in 0..300 {
+        let selection = fixture
+            .upstream
+            .select_cached("gpt-test", Some(&format!("synthetic-session-{i}")))
+            .await
+            .unwrap();
+        second += usize::from(selection.info.id == 2);
+    }
+    assert!((170..230).contains(&second), "second account: {second}");
+    fixture.db.call(|conn| {
+        conn.execute("UPDATE oauth_quota_windows SET reset_at=?1 WHERE account_id=1 AND kind='secondary'",[chrono::Utc::now().timestamp()+23*3600])?;
+        Ok(())
+    }).await.unwrap();
+    for i in 0..20 {
+        assert_eq!(
+            fixture
+                .upstream
+                .select_cached("gpt-test", Some(&format!("synthetic-session-{i}")))
+                .await
+                .unwrap()
+                .info
+                .id,
+            1
+        );
+    }
+    configure_soft_threshold(&fixture, 1, 100.0, 0).await;
+    assert_eq!(
+        fixture.upstream.select("gpt-test").await.unwrap().info.id,
+        2
+    );
+    assert!(fixture.mock.request_accounts.lock().unwrap().is_empty());
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn pacing_weights_do_not_move_owned_http_or_websocket_dialogs() {
+    for websocket in [false, true] {
+        let fixture = Fixture::start(false).await;
+        fixture.add_account(&["gpt-test"], false).await;
+        fixture.upstream.models().await.unwrap();
+        configure_soft_threshold(&fixture, 1, 10.0, 0).await;
+        configure_soft_threshold(&fixture, 2, 10.0, 0).await;
+        if websocket {
+            let mut socket = fixture.ws().await;
+            let mut body = request();
+            body["type"] = json!("response.create");
+            socket
+                .send(Message::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            let first = terminal(&mut socket).await;
+            configure_weekly_pacing(&fixture).await;
+            body["previous_response_id"] = first["response"]["id"].clone();
+            body["input"] = json!([{"role":"user","content":"synthetic continuation"}]);
+            socket
+                .send(Message::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut socket).await["type"], "response.completed");
+            socket.close(None).await.unwrap();
+            assert_eq!(
+                *fixture.mock.request_accounts.lock().unwrap(),
+                ["upstream-account", "upstream-account"]
+            );
+        } else {
+            let checkpoint = fixture
+                .compact(
+                    json!({"model":"gpt-test","input":[{"role":"user","content":"synthetic"}]}),
+                )
+                .await
+                .json::<Value>()
+                .await
+                .unwrap()["output"][0]
+                .clone();
+            assert_eq!(
+                fixture.mock.compactions.lock().unwrap()[0].0,
+                "upstream-account"
+            );
+            configure_weekly_pacing(&fixture).await;
+            let mut body = request();
+            body["stream"] = json!(false);
+            body["input"] = json!([checkpoint,{"role":"user","content":"synthetic continuation"}]);
+            assert_eq!(fixture.post(body).await.status(), 200);
+            assert_eq!(
+                *fixture.mock.request_accounts.lock().unwrap(),
+                ["upstream-account"]
+            );
+        }
+        fixture.stop().await;
+    }
+}
+
 async fn observe_expiring_reset(fixture: &Fixture, account: i64) {
     fixture.db.call(move|conn|{
         let now=chrono::Utc::now().timestamp();

@@ -316,6 +316,7 @@ pub(super) async fn request(args: &Session, mut request: ControlRequest) -> Resu
         }
     }
     if aliases {
+        decorate_account_clients(vault.as_ref(), &mut result);
         if let Some(vault) = vault.as_ref() {
             let objects = raw_request(args, ControlRequest::PrivateList).await?;
             decorate(vault, &objects, &mut result)?;
@@ -350,6 +351,30 @@ fn decorate_token_usage(vault: Option<&Vault>, report: &mut Value) {
     decorate_rows(&mut report["rows"]);
     for bucket in report["timeline"].as_array_mut().into_iter().flatten() {
         decorate_rows(&mut bucket["rows"]);
+    }
+}
+fn decorate_account_clients(vault: Option<&Vault>, report: &mut Value) {
+    for account in report["quota_accounts"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        for client in account["clients"]["rows"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            let label = client["name"].as_str().and_then(|name| {
+                if name.starts_with(PREFIX) {
+                    vault
+                        .and_then(|v| v.decrypt("token-name", name).ok())
+                        .and_then(|v| String::from_utf8(v).ok())
+                } else {
+                    Some(name.to_owned())
+                }
+            });
+            client["name"] = label.unwrap_or_else(|| "Label unavailable".into()).into();
+        }
     }
 }
 fn hide_encrypted_names(value: &mut Value) {
@@ -499,6 +524,37 @@ pub(super) async fn save_dashboard(args: &Session, settings: &Dashboard) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn account_client_labels_are_decrypted_locally_or_hidden() {
+        let vault = Vault {
+            key: [3; 32],
+            scope: b"synthetic".to_vec(),
+        };
+        let name = vault.encrypt("token-name", b"Laptop - Codex").unwrap();
+        let raw = serde_json::json!({"quota_accounts":[{"clients":{"rows":[{"id":"tok_synthetic","name":name}]}}]});
+        let mut decoded = raw.clone();
+        decorate_account_clients(Some(&vault), &mut decoded);
+        assert_eq!(
+            decoded["quota_accounts"][0]["clients"]["rows"][0]["name"],
+            "Laptop - Codex"
+        );
+        for key in [
+            None,
+            Some(&Vault {
+                key: [4; 32],
+                scope: b"synthetic".to_vec(),
+            }),
+        ] {
+            let mut hidden = raw.clone();
+            decorate_account_clients(key, &mut hidden);
+            assert_eq!(
+                hidden["quota_accounts"][0]["clients"]["rows"][0]["name"],
+                "Label unavailable"
+            );
+            assert!(!hidden.to_string().contains(PREFIX));
+            assert!(!hidden.to_string().contains("Laptop - Codex"));
+        }
+    }
     #[tokio::test]
     async fn renamed_labels_are_encrypted_and_usage_retains_distinct_revoked_tokens() {
         let dir = tempfile::tempdir().unwrap();

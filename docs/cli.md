@@ -75,7 +75,7 @@ Use an interactive terminal at least 72 columns × 20 rows. Press `?` for help o
 
 | View | What you can do |
 | --- | --- |
-| Overview | Inspect automatic routing, reset outcomes and subscription limits. Enter opens account activation and personal-label actions. Operator activation locks apply. |
+| Overview | Inspect routing, limits and recently active clients. Enter opens account details, including token labels and last-request times; Enter again opens activation and personal-label actions. Operator activation locks apply. |
 | Usage | View Today, Last 24 hours, This week or This month, grouped by total, user, model or your API tokens. |
 | Tokens | Create, rename, rotate or revoke tokens. Revoked tokens are hidden. Enter opens actions. |
 | Models | Browse account-visible models and reported limits. Enter copies the selected model ID. |
@@ -86,6 +86,8 @@ Use an interactive terminal at least 72 columns × 20 rows. Press `?` for help o
 Tokens: Enter → Rename token (or `l`) edits the selected label. Enter saves, Esc cancels, and Ctrl-U clears the field. Labels must be 1–80 bytes without control characters. Renaming encrypts the new label on the client and changes neither the bearer secret, token ID, expiry nor usage counters; past usage displays the new label on reload. CLI renaming also supports `--json` and requires no clipboard or interactive terminal.
 
 Overview shows a red `Priority` label for enabled accounts with an urgent reset-expiry/weekly-refresh deadline, along with the latest reset outcome. Ordinary reserve accounts have no routing label. `D` toggles activation and `L` edits a personal label. After deactivation, recoverable continuations automatically move to an eligible active account. There are no manual priority, switching-rule or reset-redemption actions. Soft transfers preserve a healthy original account when complete context or an eligible replacement is unavailable. See [automatic selection](account-pool.md#ranking-and-switching).
+
+Green `Best` identifies the preferred general-pool candidate for a new dialog, not the account every request must use. Details explain the reason and approximate target share; model support, cache hints and existing affinity can change selection. `Clients: N` counts your unique API tokens with inference activity on that account in the past 15 minutes, plus tokens with running requests. It does not count connected applications or idle sockets. Details show locally decrypted token labels, token IDs, running-request counts and local last-request times. Use ↑/↓ or PageUp/PageDown to scroll, `r` to refresh, Enter for actions and Esc to close. Other users' tokens are never listed.
 
 Connection fields support Left/Right, Home/End (Ctrl-A/Ctrl-E), Backspace/Delete and Ctrl-U to clear. Up/Down selects a field. Esc cancels edits; Ctrl-C exits without saving. Remote settings are saved after a successful SSH check.
 
@@ -99,7 +101,7 @@ If copying fails after issuance, the TUI keeps the secret in memory and offers `
 
 An interrupted mutation may have completed. Inspect token metadata before retrying; the client never retries automatically. Normal exit restores the terminal. After a forced kill, run `reset` if needed.
 
-Views load on demand with SSH work in the background. Switching tabs cancels reads and lets mutations finish. Overview refreshes live limits every 30 seconds when no command or confirmation is pending. Freshness refers to the upstream observation, not the screen refresh.
+Views load on demand with SSH work in the background. Switching tabs cancels reads and lets mutations finish. Overview refreshes live limits and client activity every 30 seconds when no command or confirmation is pending, including while account details are open. Freshness refers to the upstream observation, not the screen refresh.
 
 ## Limits and diagnostics
 
