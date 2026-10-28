@@ -34,6 +34,8 @@ use tokio_util::task::TaskTracker;
 mod continuation;
 mod encoding;
 mod limits;
+mod mcp;
+mod native;
 mod output;
 pub use limits::Snapshot as LimitSnapshot;
 mod transport;
@@ -62,6 +64,8 @@ struct AppState {
     http_slots: Arc<Semaphore>,
     decode_slots: Arc<Semaphore>,
     continuation_bytes: Arc<Semaphore>,
+    native_slots: Arc<Semaphore>,
+    mcp: mcp::McpState,
     generation_slots: limits::Slots,
     websocket_slots: limits::Slots,
     upstream: Option<Arc<crate::upstream::Upstream>>,
@@ -171,6 +175,8 @@ pub async fn serve(
         http_slots: Arc::new(Semaphore::new(128)),
         decode_slots: Arc::new(Semaphore::new(4)),
         continuation_bytes: Arc::new(Semaphore::new(continuation::TOTAL_BYTES)),
+        native_slots: Arc::new(Semaphore::new(4)),
+        mcp: mcp::McpState::new(config.generations_per_user),
         generation_slots: limits::Slots::new(config.generations_per_user),
         websocket_slots: limits::Slots::new(config.websockets_per_user),
         upstream: config.upstream,
@@ -277,6 +283,8 @@ pub(crate) async fn local_api(
         http_slots: Arc::new(Semaphore::new(128)),
         decode_slots: Arc::new(Semaphore::new(4)),
         continuation_bytes: Arc::new(Semaphore::new(continuation::TOTAL_BYTES)),
+        native_slots: Arc::new(Semaphore::new(4)),
+        mcp: mcp::McpState::new(8),
         generation_slots: limits::Slots::new(8),
         websocket_slots: limits::Slots::new(8),
         upstream: Some(upstream.clone()),
@@ -520,6 +528,15 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/responses", get(transport::websocket).post(responses))
         .route("/v1/responses/compact", post(compact))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/images/generations", post(native::generate))
+        .route("/v1/images/edits", post(native::edit))
+        .route("/v1/alpha/search", post(native::search))
+        .route(
+            "/mcp",
+            post(mcp::post)
+                .get(mcp::not_allowed)
+                .delete(mcp::not_allowed),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .merge(models)
@@ -848,6 +865,8 @@ mod tests {
             gateway_uid: unsafe { libc::geteuid() } + 1,
             http_slots: Arc::new(Semaphore::new(1)),
             decode_slots: Arc::new(Semaphore::new(4)),
+            native_slots: Arc::new(Semaphore::new(4)),
+            mcp: mcp::McpState::new(1),
             continuation_bytes: Arc::new(Semaphore::new(continuation::TOTAL_BYTES)),
             generation_slots: limits::Slots::new(1),
             websocket_slots: limits::Slots::new(1),

@@ -18,7 +18,7 @@ SECRET_PATTERNS = [
     re.compile(r"/(?:Users|home)/(?!runner(?:/|\b)|routercli(?:/|\b)|exetrouter(?:/|\b))[A-Za-z0-9_.-]+/"),
 ]
 URL = re.compile(r"https?://[^\s\"'`<>\\)]+")
-HOSTS = {"github.com", "api.github.com", "codeload.github.com", "raw.githubusercontent.com", "registry.npmjs.org", "opencode.ai", "chatgpt.com", "rustup.rs", "sh.rustup.rs", "www.rust-lang.org", "docs.github.com", "docs.docker.com", "www.star-history.com", "api.star-history.com"}
+HOSTS = {"github.com", "api.github.com", "codeload.github.com", "raw.githubusercontent.com", "registry.npmjs.org", "opencode.ai", "modelcontextprotocol.io", "chatgpt.com", "rustup.rs", "sh.rustup.rs", "www.rust-lang.org", "docs.github.com", "docs.docker.com", "www.star-history.com", "api.star-history.com"}
 
 
 def allowed_path(name):

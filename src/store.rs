@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/010_private_metadata.sql"),
     include_str!("migrations/011_cooldown_recovery.sql"),
     include_str!("migrations/012_automatic_routing.sql"),
+    include_str!("migrations/013_native_tools.sql"),
 ];
 pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 const QUEUE_CAPACITY: usize = 32;
@@ -122,6 +123,80 @@ impl Database {
 mod tests {
     use super::*;
     use crate::{authenticate, create_token, create_user};
+
+    #[test]
+    fn native_tools_migration_and_reupgrade_preserve_policy_credentials_and_bindings() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..12] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        let user = create_user(&conn, "synthetic").unwrap();
+        let token = create_token(&conn, &[1; 32], user, "fixture", 1).unwrap();
+        conn.execute("INSERT INTO oauth_accounts(account_id,state,encrypted_credentials,expires_at,created_at,generation,cooldown_until) VALUES('synthetic','active',X'1234',9999,0,7,2000)",[]).unwrap();
+        conn.execute(
+            "INSERT INTO account_policy(account_id,enabled,priority,locked) VALUES(1,0,10,1)",
+            [],
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO native_search_sessions VALUES(?1,zeroblob(32),1)",
+            [user],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_feature_pauses VALUES(1,'images',7,2000,1,'quota')",
+            [],
+        )
+        .unwrap();
+        // The reviewed offline rollback retains additive tables, then migration
+        // 013 can run again without losing backend ownership or cooldown.
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        init(&conn).unwrap();
+        assert!(authenticate(&conn, &[1; 32], &token.secret)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            conn.query_row(
+                "SELECT hex(encrypted_credentials),generation,cooldown_until FROM oauth_accounts",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?
+                ))
+            )
+            .unwrap(),
+            ("1234".into(), 7, 2000)
+        );
+        assert_eq!(
+            conn.query_row("SELECT enabled,locked FROM account_policy", [], |r| Ok((
+                r.get::<_, bool>(0)?,
+                r.get::<_, bool>(1)?
+            )))
+            .unwrap(),
+            (false, true)
+        );
+        for table in ["native_feature_pauses", "native_search_sessions"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+    }
 
     #[test]
     fn cooldown_recovery_migration_preserves_state_and_allows_reviewed_rollback() {

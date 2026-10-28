@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose a bearer-authenticated `/mcp` Streamable HTTP endpoint with agent-discoverable `generate_image`/`edit_image` tools and native image results. Reuse native routing/quota/accounting, scope legacy cancellation to user/client sessions, and bound/cancel response streams without replay. Support modern and legacy MCP discovery; include Codex/OpenCode configuration, SDK fixtures and explicit ingress routing. New tools are discovered on catalog refresh/reconnect, not via a claimed live notification service.
+- Add native Codex JSON image generation/editing and standalone search routes, with separate feature pauses, private user-scoped search affinity, bounded output and durable unknown-aware accounting. Include a shell-agent image helper in the exr skill; unmodified Codex's native image-tool auth gate remains an explicit limitation. Schema 13 requires the reviewed migration/rollback in `docs/native-tools.md`; no automatic deployment or live inference is implied.
 - Remove router-defined inference request-size ceilings for HTTP, compressed/decoded zstd and client WebSockets, including bundled nginx ingress. Leave model/context validation to upstream while retaining authorization, concurrency, decoder deadlines and output/recovery bounds.
 - Fragment outgoing upstream WebSocket requests without truncating context. Report upstream close 1009 as `upstream_request_too_large` without pausing the entire account, replaying inference or moving accounts.
 - Negotiate upstream WebSocket `permessage-deflate` using the exact transport revisions pinned by Codex 0.164.0. Preserve plain fragmentation when declined and retain decoded upstream event bounds; do not replay a rejected inference.

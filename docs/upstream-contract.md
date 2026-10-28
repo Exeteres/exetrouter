@@ -15,6 +15,8 @@ Reviewed client revisions live in [protocol-sources.json](protocol-sources.json)
 | Compaction | One Responses SSE request ending with `compaction_trigger`; project exactly one opaque checkpoint as `response.compaction`. No separate upstream `/responses/compact`. |
 | Chat | Translate supported HTTP JSON/SSE to Responses. Prefer HTTP for large complete requests; otherwise try WS first. Ordinary handshake fallback is allowed only before generation submission. Handshake 401/429 prevents fallback. |
 | Accounting | Create a durable event before possible submission; retain terminal counters or an explicit unknown outcome. |
+| Images | Unary JSON `/images/generations` and `/images/edits`, direct Codex OAuth; reviewed native subset, separate feature pauses, no Responses emulation. |
+| Standalone search | Unary JSON `/alpha/search`, user-scoped session ID and durable account pinning; no migration of backend references. |
 
 Redirects are disabled. Mock upstream requires explicitly enabled literal loopback HTTP. Server-owned headers never forward the client bearer, arbitrary account selection or an arbitrary upstream URL.
 
@@ -36,7 +38,7 @@ Opaque reasoning, compaction and encrypted function arguments are returned in au
 
 The [pinned rate-limit parser](https://github.com/openai/codex/blob/01fc69f4026735edfdf6789820549727a4867b11/codex-rs/codex-api/src/rate_limits.rs) defines primary/secondary headers and `codex.rate_limits` events. Store used percentage, reported duration, reset time and observation order. Remaining percentage is `max(100-used, 0)`, not a token/credit estimate. Duration labels use actual minutes; stale or elapsed observations remain historical, and missing values stay unknown.
 
-Only the general Codex meter is implemented. Separate model meters/credits need a verified bucket contract. A 100% observation alone does not prohibit generation because credits may allow it.
+Only the general Codex percentage meter is implemented. Native images/search additionally retain endpoint-scoped rejection pauses without inventing feature percentages or spending credits; see [native tools and schema 13](native-tools.md). Separate model meters/credits need a verified bucket contract. A 100% observation alone does not prohibit generation because credits may allow it.
 
 HTTP/handshake/wrapped WS 429 or recognized explicit limit errors create cooldown. Expiry uses the latest valid `Retry-After` and corresponding exhausted-window/error reset; without either, use a marked local 60-second backoff. Inspect bounded errors for reset information without persisting or exposing their contents.
 

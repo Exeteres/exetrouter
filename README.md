@@ -14,6 +14,8 @@ Use your **ChatGPT Plus or Pro subscriptions through one OpenAI-compatible endpo
 
 Codex CLI can use ChatGPT directly. ExetRouter adds shared access, separate tokens and an account pool. Supported requests consume subscription limits; clients do not receive your ChatGPT credentials.
 
+The native Codex [image-generation/editing and standalone-search routes](docs/native-tools.md) use the same OAuth pool. Connect the [MCP server](docs/mcp.md) once for agent-discoverable image tools without patching Codex authentication. The bundled exr skill also includes a shell image helper.
+
 ## How it works
 
 - **`exr`** opens the terminal dashboard: accounts, tokens, usage, subscription limits and settings. Choose **Standalone** and add an OAuth account for personal use — no server or SSH setup required.

@@ -22,6 +22,7 @@ jobs:
           rustup default stable
       - run: cargo fmt --check
       - run: python3 scripts/test-compat-agent.py
+      - run: python3 scripts/test-native-tools.py
       - name: Publication, package and Docker updater checks
         run: |
           python3 scripts/check-publication.py
@@ -53,5 +54,10 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: MCP SDK integration (synthetic loopback only)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          npm install --prefix target/mcp-sdk --ignore-scripts --no-audit --no-fund --package-lock=false @modelcontextprotocol/sdk@1.32.2
+          EXR_MCP_SDK_ROOT="$PWD/target/mcp-sdk/node_modules/@modelcontextprotocol/sdk" cargo test --locked --test native_tools mcp_official_sdk
       - name: Installer checks
         run: python3 scripts/test-installer.py

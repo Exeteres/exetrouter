@@ -1,4 +1,5 @@
 mod activation;
+pub(crate) mod native;
 use crate::{
     oauth::{self, Account, Vault},
     store::Database,

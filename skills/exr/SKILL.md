@@ -1,6 +1,6 @@
 ---
 name: exr
-description: "Use ExetRouter's exr CLI to use standalone or remote mode, configure access, inspect models, usage and upstream limits, and manage router tokens; includes Codex/OpenCode and OpenAI SDK connection guidance."
+description: "Use ExetRouter's exr CLI for standalone/remote access, models, usage and tokens; generate or edit ChatGPT images with the bundled helper; connect Codex/OpenCode and OpenAI SDK clients."
 ---
 
 # ExetRouter client
@@ -60,6 +60,14 @@ Creation/rotation require terminal stdin/stdout and prohibit JSON. Use the user'
 SSH has a 45-second deadline. Never automatically repeat a token mutation after a timeout/error: inspect metadata first; an issued secret cannot be retrieved later. SSH registration does not give users access to other users' tokens or upstream credentials. Usage by user/model is shared aggregate metadata. Token grouping shows only your own token IDs, including revoked-token history; in the dashboard Usage view, b selects grouping and Up/Down selects a token.
 
 Read [references/connections.md](references/connections.md) when connecting Codex, OpenCode or an SDK, for model metadata and endpoint configuration. Configuration/token installation into another client is a separate user-directed change; the CLI does not do it automatically.
+
+## Generate or edit an image
+
+Prefer the ExetRouter MCP server when connected: discover `generate_image` and `edit_image` through its tool list and invoke them directly. It uses the existing router bearer at `/mcp`, returns image content, and needs no built-in Codex image authorization. Read `references/connections.md` for setup; connecting another client's MCP configuration is a separate user-directed change. New server tools appear on catalog refresh/reconnect, subject to client permissions.
+
+Use bundled `scripts/image.py` with Python 3, resolving its path relative to this skill (not the project). It requires a running image-capable ExetRouter API, an existing bearer in `EXETROUTER_TOKEN`, and `EXETROUTER_BASE_URL` including `/v1` (default loopback port 8787). Never print or put the bearer in arguments. Send the requested image prompt on stdin and pass `--output NEW_FILE`; add `--reference LOCAL_IMAGE` up to five times for editing. Optional `--quality`, `--size` and `--background` pass to `gpt-image-2`. Read the returned JSON path, then inspect/show the saved image with the agent's image viewer. Do not overwrite user files or blindly retry an interrupted request.
+
+The helper uses ChatGPT OAuth through the router, not another provider or host LLM. It prints only the saved path/MIME type and never writes a response JSON/base64 file. Codex 0.165.0's built-in `image_gen` still has a client-side OAuth gate for custom bearer providers; do not fake auth state to enable it. Server schema 13 requires the reviewed migration in `docs/native-tools.md`; a newly published helper does not upgrade an existing server.
 
 ## Reset credits
 

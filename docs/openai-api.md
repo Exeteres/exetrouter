@@ -10,8 +10,12 @@ ExetRouter supports the routes below, authenticated with a router bearer. It use
 | `GET /v1/responses` with WS upgrade | Sequential native `response.create` |
 | `POST /v1/responses/compact` | One opaque compaction checkpoint |
 | `POST /v1/chat/completions` | Limited Chat JSON or SSE |
+| `POST /v1/images/generations`, `/v1/images/edits` | [Native unary Codex images](native-tools.md#image-api), JSON, one `gpt-image-2` output |
+| `POST /v1/alpha/search` | [Native standalone search](native-tools.md#standalone-web-search), scoped and account-pinned |
 
-Embeddings, image-generation/audio/Realtime, files/uploads/batches and saved-completion CRUD are not implemented. Forwarding a backend option does not add a resource endpoint or a new transport.
+Embeddings, audio/Realtime, files/uploads/batches and saved-completion CRUD are not implemented. Image routes do not provide the complete Platform Images API or bypass Codex's client-side image-tool authorization gate. Forwarding a backend option does not add a resource endpoint or a new transport.
+
+For agent tool discovery and invocation, use the separate authenticated [MCP endpoint `/mcp`](mcp.md). It reuses these native operations and returns MCP image content without requiring Codex's built-in image extension.
 
 ## Connect
 

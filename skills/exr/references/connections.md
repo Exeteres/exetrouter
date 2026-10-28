@@ -69,12 +69,18 @@ Both exports import pool metadata under a dedicated `exetrouter` provider withou
 
 Regenerate the configuration after account-pool or model changes. Keep this provider's definition in the generated file to avoid merging old model entries; unrelated settings stay in regular configuration. No plugin is needed. OpenCode keeps its standard retries. Exported providers passed mock model/tool checks in V1 1.18.34 and V2 2.0.22. V1 WS, live upstream, compaction and long context remain unverified; repository `docs/compatibility.md` records the full evidence.
 
+## MCP image tools
+
+Use the API origin's `/mcp` endpoint, not `/v1/mcp`, with the existing router bearer. Codex: `[mcp_servers.exetrouter]` with `url = "https://api.example.com/mcp"`, `bearer_token_env_var = "EXETROUTER_TOKEN"` and `tool_timeout_sec = 900`. OpenCode V2: an entry under `mcp.servers.exetrouter` with `type: "remote"`, the `/mcp` URL, `oauth: false`, `headers: {"Authorization": "Bearer {env:EXETROUTER_TOKEN}"}`, `codemode: false` and `timeout: {"execution": 900000}`. Preserve other configuration and do not embed secrets. OpenCode reloads configuration automatically; inspect `/mcps` or `opencode mcp list`.
+
+The agent discovers `generate_image` and `edit_image` with schemas/instructions. Results contain image content for the client to display/save; server-local paths are never accepted. Editing needs inline data-image/HTTPS references. Tools consume image quota and must not be retried blindly after interruption. No skill/helper or built-in Codex image extension is required. Clients can cache tool definitions until refresh/reconnect. Repository `docs/mcp.md` records protocol/client scope and deployment requirements.
+
 ## SDKs and service APIs
 
 Python: `OpenAI(base_url=URL, api_key=os.environ["EXETROUTER_TOKEN"])`. JavaScript: `new OpenAI({baseURL: URL, apiKey: process.env.EXETROUTER_TOKEN})`.
 
-Supported calls are models, Responses JSON/SSE/WS/compact and limited Chat with function tools. Use full history and `store=false`; HTTP `previous_response_id` is unsupported. Backend validates output caps and model options. Images pass through Responses `input_image`, or ordered Chat user `image_url` parts; offline forwarding evidence does not verify live vision.
+Supported calls are models, Responses JSON/SSE/WS/compact, limited Chat with function tools, and the documented native JSON image/search subset on schema-13 servers. Use full history and `store=false`; HTTP `previous_response_id` is unsupported. Backend validates output caps and model options. Image input passes through Responses `input_image`, or ordered Chat user `image_url` parts; offline forwarding evidence does not verify live vision. Use the bundled image helper for shell agents; image generation does not require a conversational host model.
 
-Normal opaque-context/WS ownership stays on the original account; quota-only transfer requires complete current context. Embeddings, image-generation/audio/files/batches and upstream Platform keys are absent. Check repository `docs/openai-api.md` before adding an integration.
+Normal opaque-context/WS ownership stays on the original account; quota-only transfer requires complete current context. Native standalone-search sessions cannot migrate backend-held references. Embeddings, audio/files/batches and upstream Platform keys are absent. Native Codex image-tool activation still requires client capability/auth support; API route availability alone does not enable it. Check repository `docs/openai-api.md` and `docs/native-tools.md` before adding an integration.
 
 Server user/key/OAuth/backup operations belong to `exrd`, under the separate server skill. They are unavailable through remote `exr`; standalone Settings manages only its local accounts. Device login requires the owner's browser interaction, and credentials must never be requested in chat.

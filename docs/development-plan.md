@@ -43,4 +43,6 @@ Versioned AMD64/ARM64 GHCR images and four native Linux/macOS targets are availa
 
 ## Optional extensions
 
+Native image/search routes, a bundled image helper and discoverable [MCP image tools](mcp.md) have offline coverage. Remaining acceptance: separately authorized live generation/edit/search, client-specific image display/save checks, optional live tool-list invalidation, and a long-term solution for the finite search-session registry. Enabling Codex's specific built-in image extension still needs an explicit custom-provider capability (without faking OAuth); ordinary MCP tools do not require it. Voice/Realtime remains separate work.
+
 Separate model quota meters/credits need a verified upstream contract. OAuth removal and wider client recovery need their own tests. Overview already polls subscription metadata every 30 seconds. Request-frequency/IP limits are not planned for small trusted deployments. Automatic bearer installation or modification of another client's configuration remains outside the product contract.
