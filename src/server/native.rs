@@ -300,7 +300,7 @@ async fn handle(
     }
     let hint = session.as_ref().map(hex::encode);
     let mut account = match upstream
-        .select_native(feature, &model, user, hint.as_deref(), pinned)
+        .select_native(feature, &model, hint.as_deref(), pinned)
         .await
     {
         Ok(account) => account,
@@ -323,7 +323,7 @@ async fn handle(
                     return context_conflict();
                 }
                 account = match upstream
-                    .select_native(feature, &model, user, hint.as_deref(), Some(owner))
+                    .select_native(feature, &model, hint.as_deref(), Some(owner))
                     .await
                 {
                     Ok(account) => account,
@@ -396,11 +396,7 @@ async fn handle(
         };
         native_headers.insert("x-codex-turn-metadata", value);
     }
-    if upstream
-        .native_eligible(&account, feature, user)
-        .await
-        .is_err()
-    {
+    if upstream.native_eligible(&account, feature).await.is_err() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_unavailable",
@@ -439,7 +435,7 @@ async fn handle(
         let result = tokio::select! {
             _ = send.closed() => Err("interrupted"),
             _ = wait_for_stop(state.stopped.clone()) => Err("interrupted"),
-            result = run(&state, &upstream, &account, &id, user, order, feature, path, &body, native_headers, &mut counters) => result,
+            result = run(&state, &upstream, &account, &id, order, feature, path, &body, native_headers, &mut counters) => result,
         };
         let result=match (result,reply) {
             (Ok((status,value)),Some(reply)) if status.is_success()=>mcp::image_result(value,reply).map(|value|(status,value)),
@@ -509,7 +505,6 @@ async fn run(
     upstream: &crate::upstream::Upstream,
     account: &crate::oauth::Account,
     id: &RequestId,
-    user: i64,
     order: i64,
     feature: Feature,
     path: &'static str,
@@ -518,7 +513,7 @@ async fn run(
     counters: &mut Counters,
 ) -> std::result::Result<(StatusCode, Value), &'static str> {
     upstream
-        .native_eligible(account, feature, user)
+        .native_eligible(account, feature)
         .await
         .map_err(|_| "interrupted")?;
     let response = upstream

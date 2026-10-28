@@ -1018,7 +1018,7 @@ async fn large_websocket_turns_use_http_and_recover_full_tool_history_without_cl
     fixture
         .db
         .call(|conn| {
-            exetrouter::account_preferences::set_user(conn, 1, 1, Some(false), None)?;
+            exetrouter::account_preferences::set_policy(conn, 1, Some(false), None, None)?;
             Ok(())
         })
         .await
@@ -3894,7 +3894,7 @@ async fn legacy_expired_context_survives_restart_on_every_response_transport() {
     fixture
         .db
         .call(|conn| {
-            exetrouter::account_preferences::set_user(conn, 1, 2, Some(false), None)?;
+            exetrouter::account_preferences::set_policy(conn, 2, Some(false), None, None)?;
             Ok(())
         })
         .await
@@ -3930,7 +3930,7 @@ async fn legacy_expired_context_survives_restart_on_every_response_transport() {
     fixture
         .db
         .call(move |conn| {
-            exetrouter::account_preferences::set_user(conn, 1, 2, Some(true), None)?;
+            exetrouter::account_preferences::set_policy(conn, 2, Some(true), None, None)?;
             exetrouter::revoke_token(conn, 1, &token)?;
             Ok(())
         })
@@ -6197,7 +6197,7 @@ async fn model_metadata_is_authenticated_persistent_and_conservative_across_acco
 }
 
 #[tokio::test]
-async fn account_preferences_route_by_user_and_operator_deactivation_moves_bound_ws() {
+async fn operator_availability_is_reversible_and_deactivation_moves_bound_ws() {
     let fixture = Fixture::start(false).await;
     let second = fixture.add_account(&["gpt-test"], false).await;
     fixture.upstream.models().await.unwrap();
@@ -6205,16 +6205,9 @@ async fn account_preferences_route_by_user_and_operator_deactivation_moves_bound
     fixture
         .db
         .call(move |conn| {
-            exetrouter::control(
-                conn,
-                &[1; 32],
-                1,
-                exetrouter::ControlRequest::AccountSet {
-                    account: second,
-                    enabled: Some(true),
-                    priority: None,
-                    routing: None,
-                },
+            conn.execute(
+                "INSERT INTO account_preferences(user_id,account_id,enabled) VALUES(1,?1,0)",
+                [second],
             )?;
             Ok(())
         })
@@ -6238,26 +6231,20 @@ async fn account_preferences_route_by_user_and_operator_deactivation_moves_bound
     fixture
         .db
         .call(move |conn| {
-            exetrouter::account_preferences::set_user(conn, 1, second, Some(false), None)?;
+            exetrouter::account_preferences::set_policy(conn, second, Some(false), None, None)?;
             Ok(())
         })
         .await
         .unwrap();
     assert_eq!(
-        fixture
-            .upstream
-            .select_for_user("gpt-test", None, Some(1))
-            .await
-            .unwrap()
-            .info
-            .id,
+        fixture.upstream.select("gpt-test").await.unwrap().info.id,
         1
     );
-    // Existing user preference is reversible without changing OAuth state.
+    // Operator availability is reversible without changing OAuth state.
     fixture
         .db
         .call(move |conn| {
-            exetrouter::account_preferences::set_user(conn, 1, second, Some(true), None)?;
+            exetrouter::account_preferences::set_policy(conn, second, Some(true), None, None)?;
             Ok(())
         })
         .await
@@ -6281,18 +6268,6 @@ async fn account_preferences_route_by_user_and_operator_deactivation_moves_bound
                 None,
                 Some(true),
             )?;
-            assert!(exetrouter::control(
-                conn,
-                &[1; 32],
-                1,
-                exetrouter::ControlRequest::AccountSet {
-                    account: second,
-                    enabled: Some(true),
-                    priority: None,
-                    routing: None
-                }
-            )
-            .is_err());
             Ok(())
         })
         .await
@@ -6314,13 +6289,7 @@ async fn account_preferences_route_by_user_and_operator_deactivation_moves_bound
         "upstream-account"
     );
     assert_eq!(
-        fixture
-            .upstream
-            .select_for_user("gpt-test", None, Some(1))
-            .await
-            .unwrap()
-            .info
-            .id,
+        fixture.upstream.select("gpt-test").await.unwrap().info.id,
         1
     );
     fixture.stop().await;
@@ -6331,9 +6300,6 @@ async fn deactivate_first_account(fixture: &Fixture, mode: &'static str) {
         .db
         .call(move |conn| {
             match mode {
-                "user" => {
-                    exetrouter::account_preferences::set_user(conn, 1, 1, Some(false), None)?;
-                }
                 "operator" => {
                     exetrouter::account_preferences::set_policy(
                         conn,
@@ -6356,7 +6322,7 @@ async fn deactivate_first_account(fixture: &Fixture, mode: &'static str) {
 
 #[tokio::test]
 async fn deactivation_transfers_http_forks_compaction_and_reopened_context() {
-    for mode in ["user", "operator", "oauth"] {
+    for mode in ["operator", "oauth"] {
         let mut fixture = Fixture::start(false).await;
         *fixture.mock.mode.lock().unwrap() = "turn_state".into();
         let initial = fixture.compact(json!({"model":"gpt-test","input":[{"role":"user","content":"synthetic checkpoint"}]})).await;
@@ -6450,7 +6416,7 @@ async fn deactivation_transfers_http_forks_compaction_and_reopened_context() {
 
 #[tokio::test]
 async fn deactivation_recovers_encrypted_tools_and_retires_turn_state_on_bound_ws() {
-    for mode in ["user", "operator", "oauth"] {
+    for mode in ["operator", "oauth"] {
         let fixture = Fixture::start(false).await;
         *fixture.mock.mode.lock().unwrap() = "turn_state".into();
         fixture.mock.tools.store(true, Ordering::SeqCst);
@@ -6560,7 +6526,7 @@ async fn deactivation_never_reuses_disabled_ws_when_replacement_is_unavailable()
             assert_eq!(terminal(&mut socket).await["type"], "response.completed");
         }
         fixture.add_account(&["gpt-test"], false).await;
-        deactivate_first_account(&fixture, "user").await;
+        deactivate_first_account(&fixture, "operator").await;
         let before = fixture.rows().await.len();
         body["previous_response_id"] = first["response"]["id"].clone();
         if guard == "handshake" {
@@ -6921,14 +6887,7 @@ async fn current_clients_continue_tools_across_a_quota_account_switch() {
                 "quota_http_after_tool"
             },
         );
-        fixture
-            .db
-            .call(|conn| {
-                exetrouter::account_preferences::set_user(conn, 1, 1, None, Some(10))?;
-                Ok(())
-            })
-            .await
-            .unwrap();
+        observe_expiring_reset(&fixture, 1).await;
         fixture.mock.tools.store(true, Ordering::SeqCst);
         let probe = probe::Probe::bounded(&fixture.url, 12).await.unwrap();
         let output = native::Run {
@@ -7032,8 +6991,8 @@ async fn native_clients_retain_stateless_transfer_receipts_after_router_and_proc
             .get_mut("upstream-account-2")
             .unwrap()
             .mode = "native_proofs".into();
+        observe_expiring_reset(&fixture, 1).await;
         fixture.db.call(|conn| {
-            exetrouter::account_preferences::set_user(conn, 1, 1, None, Some(10))?;
             conn.execute_batch("CREATE TRIGGER no_context_insert BEFORE INSERT ON context_bindings BEGIN SELECT RAISE(ABORT,'no context writes'); END;")?;
             Ok(())
         }).await.unwrap();
@@ -7716,7 +7675,7 @@ async fn urgency_is_shared_by_chat_and_compact_and_respects_deactivation() {
     fixture
         .db
         .call(|conn| {
-            exetrouter::account_preferences::set_user(conn, 1, 2, Some(false), None)?;
+            exetrouter::account_preferences::set_policy(conn, 2, Some(false), None, None)?;
             Ok(())
         })
         .await

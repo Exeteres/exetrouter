@@ -1243,7 +1243,7 @@ async fn image_cooldown_is_durable_feature_scoped_and_survives_credential_refres
 }
 
 #[tokio::test]
-async fn text_quota_does_not_block_images_but_deactivation_and_operator_locks_do() {
+async fn images_ignore_text_quota_and_retired_preferences_but_respect_operator_deactivation() {
     let fixture = Fixture::start().await;
     fixture
         .db
@@ -1278,16 +1278,8 @@ async fn text_quota_does_not_block_images_but_deactivation_and_operator_locks_do
     fixture.db.call(|conn| {conn.execute("UPDATE account_policy SET enabled=1,locked=0",[])?;conn.execute("INSERT INTO account_preferences(user_id,account_id,enabled,priority) VALUES(1,1,0,0)",[])?;Ok(())}).await.unwrap();
     assert_eq!(
         fixture.post("images/generations", image()).await.status(),
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::OK
     );
-    fixture
-        .db
-        .call(|conn| {
-            conn.execute("UPDATE account_preferences SET enabled=1", [])?;
-            Ok(())
-        })
-        .await
-        .unwrap();
     fixture
         .db
         .call(|conn| {
@@ -1300,7 +1292,7 @@ async fn text_quota_does_not_block_images_but_deactivation_and_operator_locks_do
         fixture.post("images/generations", image()).await.status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    assert_eq!(fixture.native.calls.lock().unwrap().len(), 1);
+    assert_eq!(fixture.native.calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

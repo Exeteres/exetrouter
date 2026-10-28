@@ -365,7 +365,7 @@ impl Upstream {
         Ok(models)
     }
 
-    pub async fn account_enabled(&self, user: i64, id: i64) -> crate::Result<bool> {
+    pub async fn account_enabled(&self, id: i64) -> crate::Result<bool> {
         self.db
             .call(move |conn| {
                 // Only explicit deactivation permits this availability transfer;
@@ -375,8 +375,7 @@ impl Upstream {
                     [id],
                     |row| row.get::<_, bool>(0),
                 )?;
-                Ok(!disabled
-                    && crate::account_preferences::effective(conn, Some(user), id)?.enabled)
+                Ok(!disabled && crate::account_preferences::effective(conn, id)?.enabled)
             })
             .await
     }
@@ -390,23 +389,13 @@ impl Upstream {
         model: &str,
         affinity: Option<&str>,
     ) -> std::result::Result<Selection, SelectError> {
-        self.select_for_user(model, affinity, None).await
-    }
-
-    pub async fn select_for_user(
-        &self,
-        model: &str,
-        affinity: Option<&str>,
-        user: Option<i64>,
-    ) -> std::result::Result<Selection, SelectError> {
-        self.select_excluding(model, affinity, user, &[]).await
+        self.select_excluding(model, affinity, &[]).await
     }
 
     pub(crate) async fn select_excluding(
         &self,
         model: &str,
         affinity: Option<&str>,
-        user: Option<i64>,
         excluded: &[i64],
     ) -> std::result::Result<Selection, SelectError> {
         let cached_model = model.to_owned();
@@ -416,7 +405,7 @@ impl Upstream {
             let mut stmt=conn.prepare("SELECT a.id FROM oauth_accounts a JOIN oauth_models m ON m.account_id=a.id WHERE a.state='active' AND m.model=?1 AND a.expires_at>?2+60 AND a.catalog_updated_at<=?2 AND a.catalog_updated_at>?2-60 AND (a.cooldown_until IS NULL OR a.cooldown_until<=?2) AND NOT EXISTS(SELECT 1 FROM oauth_health h WHERE h.account_id=a.id AND h.generation=a.generation AND h.retry_at>?2)")?;
             for id in stmt.query_map(params![cached_model,now],|row|row.get::<_,i64>(0))? {
                 let id=id?;
-                if !cached_excluded.contains(&id) && crate::account_preferences::effective(conn,user,id)?.enabled {
+                if !cached_excluded.contains(&id) && crate::account_preferences::effective(conn,id)?.enabled {
                     return Ok(true);
                 }
             }
@@ -450,7 +439,7 @@ impl Upstream {
             let mut thresholds=Vec::new();
             let mut earliest=None;
             for (id,until,health,expires) in rows {
-                let preference=crate::account_preferences::effective(conn,user,id)?;
+                let preference=crate::account_preferences::effective(conn,id)?;
                 if !preference.enabled { continue; }
                 let cooldown=until.filter(|until|*until>now);
                 let health=health.filter(|until|*until>now);
@@ -552,12 +541,11 @@ impl Upstream {
 
     pub(crate) async fn threshold_reached(
         &self,
-        user: i64,
         id: i64,
     ) -> std::result::Result<bool, SelectError> {
         self.db
             .call(move |conn| {
-                if !crate::account_preferences::effective(conn, Some(user), id)?.enabled {
+                if !crate::account_preferences::effective(conn, id)?.enabled {
                     return Ok(false);
                 }
                 let now = Utc::now().timestamp();
@@ -572,32 +560,26 @@ impl Upstream {
         &self,
         model: &str,
         affinity: Option<&str>,
-        user: i64,
         owner: Option<i64>,
     ) -> std::result::Result<Selection, SelectError> {
         let Some(id) = owner else {
-            return self.select_for_user(model, affinity, Some(user)).await;
+            return self.select_cached(model, affinity).await;
         };
         if !self
-            .account_enabled(user, id)
+            .account_enabled(id)
             .await
             .map_err(|_| SelectError::UpstreamUnavailable)?
         {
-            return self
-                .select_excluding(model, affinity, Some(user), &[id])
-                .await;
+            return self.select_excluding(model, affinity, &[id]).await;
         }
-        let pinned = self.select_pinned_for_user(model, id, Some(user)).await;
+        let pinned = self.select_pinned(model, id).await;
         let exhausted = self.quota_exhausted(id).await?;
-        let threshold = self.threshold_reached(user, id).await?;
-        let preempted = self.routing_preempted(model, user, id).await?;
+        let threshold = self.threshold_reached(id).await?;
+        let preempted = self.routing_preempted(model, id).await?;
         if (exhausted || threshold || preempted)
             && matches!(pinned, Ok(_) | Err(SelectError::Cooldown(_)))
         {
-            if let Ok(alternate) = self
-                .select_excluding(model, affinity, Some(user), &[id])
-                .await
-            {
+            if let Ok(alternate) = self.select_excluding(model, affinity, &[id]).await {
                 // Avoid leaving credit-backed capacity for another exhausted subscription.
                 let better = if !exhausted && !threshold {
                     let alternative = alternate.info.id;
@@ -617,7 +599,7 @@ impl Upstream {
                     && !self.quota_exhausted(alternate.info.id).await?
                     && (exhausted
                         || !threshold
-                        || !self.threshold_reached(user, alternate.info.id).await?)
+                        || !self.threshold_reached(alternate.info.id).await?)
                 {
                     return Ok(alternate);
                 }
@@ -631,7 +613,6 @@ impl Upstream {
     pub(crate) async fn routing_preempted(
         &self,
         model: &str,
-        user: i64,
         owner: i64,
     ) -> std::result::Result<bool, SelectError> {
         let requested = model.to_owned();
@@ -642,7 +623,7 @@ impl Upstream {
             let ids=stmt.query_map(params![owner,requested,now],|r|r.get::<_,i64>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
             let mut urgent=Vec::new();
             for id in ids {
-                if !crate::account_preferences::effective(conn,Some(user),id)?.enabled {continue;}
+                if !crate::account_preferences::effective(conn,id)?.enabled {continue;}
                 let candidate=crate::routing::decision(conn,id,now)?;
                 let quota=crate::quota::summary(conn,id,now)?;
                 if candidate.compare(&current).is_lt() && !candidate.reached(&quota) && quota.status=="observed" {urgent.push((candidate,id));}
@@ -714,17 +695,9 @@ impl Upstream {
         model: &str,
         id: i64,
     ) -> std::result::Result<Selection, SelectError> {
-        self.select_pinned_for_user(model, id, None).await
-    }
-    pub async fn select_pinned_for_user(
-        &self,
-        model: &str,
-        id: i64,
-        user: Option<i64>,
-    ) -> std::result::Result<Selection, SelectError> {
         let enabled = self
             .db
-            .call(move |conn| Ok(crate::account_preferences::effective(conn, user, id)?.enabled))
+            .call(move |conn| Ok(crate::account_preferences::effective(conn, id)?.enabled))
             .await
             .map_err(|_| SelectError::UpstreamUnavailable)?;
         if !enabled {
@@ -879,7 +852,6 @@ impl Upstream {
     pub(crate) async fn connect_with_quota_fallback(
         &self,
         mut account: Selection,
-        user: i64,
         model: &str,
         identity: (&str, &str),
         payload: &mut Value,
@@ -898,7 +870,7 @@ impl Upstream {
                         return Err(SocketError::Cooldown(until));
                     }
                     account = self
-                        .select_excluding(model, None, Some(user), &excluded)
+                        .select_excluding(model, None, &excluded)
                         .await
                         .map_err(|_| SocketError::Cooldown(until))?;
                     if let Some(metadata) = payload

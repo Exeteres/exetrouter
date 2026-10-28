@@ -1,4 +1,4 @@
-//! Reversible availability only. Routing economics cannot be overridden.
+//! Operator-owned availability only. Routing economics cannot be overridden.
 use crate::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -45,47 +45,8 @@ impl Default for Preference {
         }
     }
 }
-pub fn effective(conn: &Connection, user: Option<i64>, account: i64) -> Result<Preference> {
-    Ok(conn.query_row("SELECT COALESCE(p.enabled,1) AND CASE WHEN COALESCE(p.locked,0)=1 THEN 1 ELSE COALESCE(u.enabled,1) END,COALESCE(p.locked,0) FROM oauth_accounts a LEFT JOIN account_policy p ON p.account_id=a.id LEFT JOIN account_preferences u ON u.account_id=a.id AND u.user_id=?1 WHERE a.id=?2",params![user,account],|r|Ok(Preference{enabled:r.get(0)?,locked:r.get(1)?}))?)
-}
-pub fn set_user(
-    conn: &mut Connection,
-    user: i64,
-    account: i64,
-    enabled: Option<bool>,
-    priority: Option<i32>,
-) -> Result<Preference> {
-    set_user_rules(
-        conn,
-        user,
-        account,
-        enabled,
-        priority,
-        &RoutingArgs::default(),
-    )
-}
-pub fn set_user_rules(
-    conn: &mut Connection,
-    user: i64,
-    account: i64,
-    enabled: Option<bool>,
-    priority: Option<i32>,
-    patch: &RoutingArgs,
-) -> Result<Preference> {
-    patch.validate()?;
-    if priority.is_some() {
-        return Err("Account routing is automatic; manual priority is no longer supported".into());
-    }
-    let tx = conn.transaction()?;
-    if effective(&tx, Some(user), account)?.locked {
-        return Err("Account settings are locked by the server operator".into());
-    }
-    if let Some(enabled) = enabled {
-        tx.execute("INSERT INTO account_preferences(user_id,account_id,enabled) VALUES(?1,?2,?3) ON CONFLICT(user_id,account_id) DO UPDATE SET enabled=excluded.enabled",params![user,account,enabled])?;
-    }
-    let result = effective(&tx, Some(user), account)?;
-    tx.commit()?;
-    Ok(result)
+pub fn effective(conn: &Connection, account: i64) -> Result<Preference> {
+    Ok(conn.query_row("SELECT COALESCE(p.enabled,1),COALESCE(p.locked,0) FROM oauth_accounts a LEFT JOIN account_policy p ON p.account_id=a.id WHERE a.id=?1",[account],|r|Ok(Preference{enabled:r.get(0)?,locked:r.get(1)?}))?)
 }
 pub fn set_policy(
     conn: &mut Connection,
@@ -116,9 +77,9 @@ pub fn set_policy_rules(
         return Err("Account routing is automatic; manual priority is no longer supported".into());
     }
     let tx = conn.transaction()?;
-    let previous = effective(&tx, None, account)?;
+    let previous = effective(&tx, account)?;
     tx.execute("INSERT INTO account_policy(account_id,enabled,locked) VALUES(?1,?2,?3) ON CONFLICT(account_id) DO UPDATE SET enabled=excluded.enabled,locked=excluded.locked",params![account,enabled.unwrap_or(previous.enabled),locked.unwrap_or(previous.locked)])?;
-    let result = effective(&tx, None, account)?;
+    let result = effective(&tx, account)?;
     tx.commit()?;
     Ok(result)
 }
@@ -132,7 +93,7 @@ pub fn annotate(conn: &Connection, user: i64, value: &mut serde_json::Value) -> 
         let mut clients = crate::usage::clients_by_account(conn, user, now)?;
         for row in rows.iter_mut() {
             if let Some(id) = row["id"].as_i64() {
-                let preference = effective(conn, Some(user), id)?;
+                let preference = effective(conn, id)?;
                 let quota = crate::quota::summary(conn, id, now)?;
                 row["preference"] = serde_json::to_value(&preference)?;
                 let routing = crate::routing::decision(conn, id, now)?;
@@ -194,7 +155,7 @@ pub fn annotate(conn: &Connection, user: i64, value: &mut serde_json::Value) -> 
 mod tests {
     use super::*;
     #[test]
-    fn best_and_shares_follow_fresh_capacity_and_personal_availability() {
+    fn best_and_shares_follow_fresh_capacity_and_operator_availability() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::store::init(&conn).unwrap();
         let user = crate::create_user(&conn, "synthetic").unwrap();
@@ -217,7 +178,7 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((share - 200.0 / 3.0).abs() < 0.01);
-        set_user(&mut conn, user, 2, Some(false), None).unwrap();
+        set_policy(&mut conn, 2, Some(false), None, None).unwrap();
         let value = snapshot(&conn);
         assert_eq!(value["quota_accounts"][0]["routing"]["best"], true);
         assert_eq!(
@@ -225,7 +186,7 @@ mod tests {
             100.0
         );
         assert_eq!(value["quota_accounts"][1]["routing"]["best"], false);
-        set_user(&mut conn, user, 2, Some(true), None).unwrap();
+        set_policy(&mut conn, 2, Some(true), None, None).unwrap();
         for restriction in [
             format!("cooldown_until={}", now + 60),
             "state='reauth_required'".into(),
@@ -269,7 +230,7 @@ mod tests {
             .all(|r| r["routing"]["best"] == false));
     }
     #[test]
-    fn automatic_routing_cannot_be_overridden_but_availability_and_locks_survive() {
+    fn legacy_personal_preferences_are_ignored_and_only_operator_policy_applies() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::store::init(&conn).unwrap();
         crate::create_user(&conn, "synthetic").unwrap();
@@ -279,24 +240,25 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(effective(&conn, Some(1), 1).unwrap().enabled);
-        assert!(set_user(&mut conn, 1, 1, None, Some(10)).is_err());
+        conn.execute(
+            "INSERT INTO account_preferences(user_id,account_id,enabled,priority) VALUES(1,1,0,10)",
+            [],
+        )
+        .unwrap();
+        assert!(effective(&conn, 1).unwrap().enabled);
         let legacy: RoutingArgs =
             serde_json::from_value(serde_json::json!({"switch_at":20})).unwrap();
         assert!(set_policy_rules(&mut conn, 1, None, None, None, &legacy).is_err());
-        assert!(
-            !set_user(&mut conn, 1, 1, Some(false), None)
-                .unwrap()
-                .enabled
-        );
+        assert!(set_policy(&mut conn, 1, None, Some(10), None).is_err());
         assert!(
             set_policy(&mut conn, 1, Some(true), None, Some(true))
                 .unwrap()
                 .locked
         );
-        assert!(effective(&conn, Some(1), 1).unwrap().enabled);
-        assert!(set_user(&mut conn, 1, 1, Some(false), None).is_err());
+        assert!(effective(&conn, 1).unwrap().enabled);
         set_policy(&mut conn, 1, None, None, Some(false)).unwrap();
-        assert!(!effective(&conn, Some(1), 1).unwrap().enabled);
+        assert!(effective(&conn, 1).unwrap().enabled);
+        set_policy(&mut conn, 1, Some(false), None, None).unwrap();
+        assert!(!effective(&conn, 1).unwrap().enabled);
     }
 }

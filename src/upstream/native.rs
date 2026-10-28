@@ -55,7 +55,6 @@ impl Upstream {
         &self,
         feature: Feature,
         model: &str,
-        user: i64,
         hint: Option<&str>,
         pinned: Option<i64>,
     ) -> std::result::Result<Selection, SelectError> {
@@ -68,14 +67,11 @@ impl Upstream {
             if let Some((_, until, quota)) = blocked.iter().find(|(account, _, _)| *account == id) {
                 return Err(wait(*until, *quota));
             }
-            return self.select_pinned_for_user(model, id, Some(user)).await;
+            return self.select_pinned(model, id).await;
         }
         if feature == Feature::Search {
             let excluded = blocked.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
-            return match self
-                .select_excluding(model, hint, Some(user), &excluded)
-                .await
-            {
+            return match self.select_excluding(model, hint, &excluded).await {
                 Err(SelectError::UpstreamUnavailable) if !blocked.is_empty() => {
                     let (_, at, quota) = blocked
                         .iter()
@@ -95,7 +91,7 @@ impl Upstream {
                 let mut cooldown: Option<(i64, bool)> = None;
                 for info in crate::oauth::list(conn)? {
                     if info.state == "active"
-                        && crate::account_preferences::effective(conn, Some(user), info.id)?.enabled
+                        && crate::account_preferences::effective(conn, info.id)?.enabled
                         && info
                             .health_until
                             .is_none_or(|at| at <= Utc::now().timestamp())
@@ -127,7 +123,7 @@ impl Upstream {
             if free_plan(&account.credentials.access_token) {
                 continue;
             }
-            if self.native_eligible(&account, feature, user).await.is_ok() {
+            if self.native_eligible(&account, feature).await.is_ok() {
                 return Ok(Selection {
                     account,
                     _reservation: reservation,
@@ -141,16 +137,11 @@ impl Upstream {
         )
     }
 
-    pub(crate) async fn native_eligible(
-        &self,
-        account: &Account,
-        feature: Feature,
-        user: i64,
-    ) -> Result<()> {
+    pub(crate) async fn native_eligible(&self, account: &Account, feature: Feature) -> Result<()> {
         let (id, generation) = (account.info.id, account.info.generation);
         self.db.call(move |conn| {
             let valid = conn.query_row("SELECT EXISTS(SELECT 1 FROM oauth_accounts WHERE id=?1 AND generation=?2 AND state='active')", params![id,generation], |row| row.get::<_,bool>(0))?;
-            if !valid || !crate::account_preferences::effective(conn, Some(user), id)?.enabled
+            if !valid || !crate::account_preferences::effective(conn, id)?.enabled
                 || crate::health::paused(conn, id, Utc::now().timestamp())?.is_some()
                 || paused(conn, id, feature)?.is_some()
                 || (feature == Feature::Search && crate::quota::blocked_until(conn, id, Utc::now().timestamp())?.is_some())

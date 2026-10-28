@@ -300,8 +300,11 @@ mod tests {
         conn.execute("INSERT INTO account_preferences VALUES(1,1,0,-100)", [])
             .unwrap();
         init(&conn).unwrap();
-        let preference = crate::account_preferences::effective(&conn, Some(1), 1).unwrap();
-        assert!(!preference.enabled);
+        let preference = crate::account_preferences::effective(&conn, 1).unwrap();
+        assert!(
+            preference.enabled,
+            "retired personal availability is ignored"
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT priority FROM account_policy WHERE account_id=1",
@@ -321,12 +324,12 @@ mod tests {
             10
         );
         assert!(
-            crate::account_preferences::effective(&conn, Some(1), 2)
+            crate::account_preferences::effective(&conn, 2)
                 .unwrap()
                 .locked
         );
         assert!(
-            crate::account_preferences::effective(&conn, Some(1), 3)
+            crate::account_preferences::effective(&conn, 3)
                 .unwrap()
                 .enabled
         );

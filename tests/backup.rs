@@ -76,7 +76,8 @@ fn state() -> State {
         [account],
     )
     .unwrap();
-    exetrouter::account_preferences::set_user(&mut conn, user, account, Some(false), None).unwrap();
+    exetrouter::account_preferences::set_policy(&mut conn, account, Some(false), None, None)
+        .unwrap();
     State {
         directory,
         paths,
@@ -195,7 +196,7 @@ fn cli_snapshot_includes_live_wal_keys_and_restores_a_restartable_state() {
     let account = oauth::load(&conn, &oauth::Vault::new([2; 32]), 1).unwrap();
     assert!(account.credentials.access_token == "fixture-access");
     assert!(account.credentials.refresh_token == "fixture-refresh");
-    let preferences = exetrouter::account_preferences::effective(&conn, Some(1), 1).unwrap();
+    let preferences = exetrouter::account_preferences::effective(&conn, 1).unwrap();
     assert!(!preferences.enabled);
     for table in ["context_bindings", "oauth_quota_windows", "oauth_health"] {
         assert_eq!(

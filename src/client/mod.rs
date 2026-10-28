@@ -114,21 +114,13 @@ enum CommandLine {
 
 #[derive(Subcommand)]
 enum AccountCommand {
-    /// Set reversible availability for your user (remote or standalone).
-    Set {
-        id: i64,
-        #[arg(long,action=clap::ArgAction::Set)]
-        enabled: Option<bool>,
-    },
-    /// Reactivate an account for your user without signing in again.
-    Enable { id: i64 },
     /// List local accounts by email and state, without credentials.
     List,
     /// Sign in through a browser device-code flow.
     Add,
     /// Reauthorize the same account through a browser.
     Reauth { id: i64 },
-    /// Reversibly deactivate routing for your user; retain OAuth state.
+    /// Disable a local OAuth account; retain credentials for reauthorization.
     Disable {
         id: i64,
         #[arg(long)]
@@ -250,47 +242,18 @@ async fn run_session(args: &Session, config_path: &std::path::Path) -> Result<()
         return Ok(());
     }
     if let CommandLine::Account { command } = &args.command {
-        let preference = match command {
-            AccountCommand::Set { id, enabled } => Some((*id, *enabled)),
-            AccountCommand::Enable { id } => Some((*id, Some(true))),
-            AccountCommand::Disable { id, yes } => {
-                if !yes {
-                    config::confirm("Deactivate this account for your user?")?;
-                }
-                Some((*id, Some(false)))
-            }
-            _ => None,
-        };
-        if let Some((id, enabled)) = preference {
-            let value = ssh_request(
-                args,
-                ControlRequest::AccountSet {
-                    account: id,
-                    enabled,
-                    priority: None,
-                    routing: None,
-                },
-            )
-            .await?;
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
-                println!(
-                    "Account availability\n\nEnabled   {}\nLocked    {}\nRouting   automatic",
-                    value["enabled"], value["locked"],
-                );
-            }
-            return Ok(());
-        }
-    }
-    if let CommandLine::Account { command } = &args.command {
         let local = args.connection.local.as_ref().ok_or(
             "Account management belongs to standalone mode. Server operators use exrd admin oauth.",
         )?;
         let value = match command {
-            AccountCommand::Set { .. }
-            | AccountCommand::Enable { .. }
-            | AccountCommand::Disable { .. } => unreachable!(),
+            AccountCommand::Disable { id, yes } => {
+                if !yes {
+                    config::confirm(
+                        "Disable this local OAuth account? Reauthorize it to enable it again.",
+                    )?;
+                }
+                local.disable(*id).await?
+            }
             AccountCommand::List => local.accounts().await?,
             AccountCommand::Add | AccountCommand::Reauth { .. } => {
                 if args.json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {

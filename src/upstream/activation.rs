@@ -46,7 +46,7 @@ fn claim(
     let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM oauth_accounts WHERE id=?1 AND generation=?2 AND state='active')", params![account,generation], |row| row.get(0))?;
     if !valid
         || blocked
-        || !crate::account_preferences::effective(&tx, Some(user), account)?.enabled
+        || !crate::account_preferences::effective(&tx, account)?.enabled
         || crate::health::paused(&tx, account, now)?.is_some()
     {
         tx.commit()?;
@@ -67,10 +67,7 @@ impl Upstream {
     ) -> Option<String> {
         inactive_reset(quota, Utc::now().timestamp())?;
         let _permit = self.activation_gate.try_lock().ok()?;
-        let selected = self
-            .select_pinned_for_user(MODEL, account, Some(user))
-            .await
-            .ok()?;
+        let selected = self.select_pinned(MODEL, account).await.ok()?;
         let generation = selected.info.generation;
         let attempt = self
             .db
@@ -239,6 +236,15 @@ mod tests {
             params![account, now + WEEK, now],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO account_preferences(user_id,account_id,enabled) VALUES(?1,?2,0)",
+            params![user, account],
+        )
+        .unwrap();
+        crate::account_preferences::set_policy(&mut conn, account, Some(false), None, None)
+            .unwrap();
+        assert!(claim(&mut conn, account, 0, user, now).unwrap().is_none());
+        crate::account_preferences::set_policy(&mut conn, account, Some(true), None, None).unwrap();
         assert!(claim(&mut conn, account, 0, user, now).unwrap().is_some());
         conn.execute(
             "UPDATE oauth_quota_windows SET observed_at=?1,reset_at=?2",

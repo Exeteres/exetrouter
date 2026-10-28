@@ -529,7 +529,7 @@ pub(crate) fn transfer_references(
 ) -> Result<Vec<Digest>> {
     let tx = conn.transaction()?;
     let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM oauth_accounts WHERE id=?1 AND generation=?2 AND state='active')", params![account,generation], |r| r.get(0))?;
-    if !valid || !crate::account_preferences::effective(&tx, Some(user), account)?.enabled {
+    if !valid || !crate::account_preferences::effective(&tx, account)?.enabled {
         return Err("account changed before context transfer".into());
     }
     let mut digests = Vec::new();

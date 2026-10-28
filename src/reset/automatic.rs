@@ -68,9 +68,8 @@ fn eligible(current: &Live, now: i64) -> Option<&Credit> {
 }
 
 pub(super) fn authorized(conn: &Connection, id: i64, generation: i64, now: i64) -> Result<bool> {
-    // At least one user must still be allowed to use this account. In standalone
-    // this includes the owner's personal deactivation, not just global policy.
-    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM oauth_accounts a LEFT JOIN account_policy p ON p.account_id=a.id WHERE a.id=?1 AND a.generation=?2 AND a.state='active' AND COALESCE(p.enabled,1)=1 AND EXISTS(SELECT 1 FROM users u LEFT JOIN account_preferences pref ON pref.user_id=u.id AND pref.account_id=a.id WHERE COALESCE(p.locked,0)=1 OR COALESCE(pref.enabled,1)=1))",params![id,generation],|r|r.get(0))?;
+    // Require an active operator-enabled account and at least one router user.
+    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM oauth_accounts a LEFT JOIN account_policy p ON p.account_id=a.id WHERE a.id=?1 AND a.generation=?2 AND a.state='active' AND COALESCE(p.enabled,1)=1 AND EXISTS(SELECT 1 FROM users))",params![id,generation],|r|r.get(0))?;
     if !valid || crate::health::paused(conn, id, now)?.is_some() {
         return Ok(false);
     }
@@ -734,7 +733,12 @@ mod tests {
         f.upstream
             .db
             .call(|conn| {
-                crate::account_preferences::set_user(conn, 1, 1, Some(false), None)?;
+                conn.execute(
+                    "INSERT INTO account_preferences(user_id,account_id,enabled) VALUES(1,1,0)",
+                    [],
+                )?;
+                assert!(authorized(conn, 1, 0, Utc::now().timestamp())?);
+                crate::account_preferences::set_policy(conn, 1, Some(false), None, None)?;
                 Ok(())
             })
             .await
@@ -744,7 +748,7 @@ mod tests {
         f.upstream
             .db
             .call(|conn| {
-                crate::account_preferences::set_user(conn, 1, 1, Some(true), None)?;
+                crate::account_preferences::set_policy(conn, 1, Some(true), None, None)?;
                 let order = crate::health::next(conn)?;
                 crate::health::failure(
                     conn,

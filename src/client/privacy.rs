@@ -19,8 +19,7 @@ use std::{
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Kind {
-    Account,
+enum Kind {
     Settings,
 }
 
@@ -266,7 +265,7 @@ pub(super) async fn request(args: &Session, mut request: ControlRequest) -> Resu
             .ok_or("a saved client profile is required to encrypt token names")?
             .encrypt("token-name", name.as_bytes())?;
     }
-    let aliases = matches!(request, ControlRequest::Limits | ControlRequest::Doctor);
+    let account_clients = matches!(request, ControlRequest::Limits | ControlRequest::Doctor);
     let token_list = matches!(request, ControlRequest::TokenList);
     let token_names = matches!(
         request,
@@ -315,12 +314,8 @@ pub(super) async fn request(args: &Session, mut request: ControlRequest) -> Resu
             hide_encrypted_names(&mut result);
         }
     }
-    if aliases {
+    if account_clients {
         decorate_account_clients(vault.as_ref(), &mut result);
-        if let Some(vault) = vault.as_ref() {
-            let objects = raw_request(args, ControlRequest::PrivateList).await?;
-            decorate(vault, &objects, &mut result)?;
-        }
     }
     Ok(result)
 }
@@ -399,90 +394,6 @@ fn hide_encrypted_names(value: &mut Value) {
         _ => {}
     }
 }
-fn decorate(vault: &Vault, objects: &Value, value: &mut Value) -> Result<()> {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                decorate(vault, objects, item)?;
-            }
-        }
-        Value::Object(map) => {
-            // Diagnostic account rows contain an email and a numeric account identifier.
-            if map.contains_key("email") || (map.contains_key("label") && map.contains_key("quota"))
-            {
-                if let Some(id) = map
-                    .get("id")
-                    .or_else(|| map.get("account_id"))
-                    .and_then(Value::as_i64)
-                {
-                    let object_id = vault.object_id(Kind::Account, &id.to_string())?;
-                    if let Some(ciphertext) = objects[&object_id].as_str() {
-                        let object: Object =
-                            serde_json::from_slice(&vault.decrypt(&object_id, ciphertext)?)
-                                .map_err(|_| "invalid private object")?;
-                        map.insert("display_name".into(), object.value.trim().into());
-                    }
-                }
-            }
-            for child in map.values_mut() {
-                decorate(vault, objects, child)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-pub(super) fn seal(
-    connection: &Connection,
-    kind: Kind,
-    id: &str,
-    value: &str,
-) -> Result<ControlRequest> {
-    let vault = Vault::open(connection)?;
-    let object_id = vault.object_id(kind, id)?;
-    if value.len() > 8192 {
-        return Err("personal text exceeds 8192 bytes".into());
-    }
-    if matches!(kind, Kind::Account)
-        && !value.is_empty()
-        && (value.trim().is_empty() || value.len() > 256)
-    {
-        return Err("label must be 1–256 bytes".into());
-    }
-    let ciphertext = if value.is_empty() {
-        None
-    } else {
-        Some(vault.encrypt(
-            &object_id,
-            &serde_json::to_vec(&Object {
-                kind,
-                id: id.into(),
-                value: value.into(),
-            })?,
-        )?)
-    };
-    Ok(ControlRequest::PrivatePut {
-        id: object_id,
-        ciphertext,
-    })
-}
-
-pub(super) async fn local_accounts(args: &Session) -> Result<Value> {
-    let mut value = args
-        .connection
-        .local
-        .as_ref()
-        .ok_or("standalone service unavailable")?
-        .accounts()
-        .await?;
-    if let Ok(vault) = Vault::open(&args.connection) {
-        let objects = raw_request(args, ControlRequest::PrivateList).await?;
-        decorate(&vault, &objects, &mut value)?;
-    }
-    Ok(value)
-}
-
 pub(super) async fn dashboard(args: &Session) -> Result<Option<Dashboard>> {
     let vault = Vault::open(&args.connection)?;
     let id = vault.object_id(Kind::Settings, "dashboard")?;
@@ -788,6 +699,53 @@ mod tests {
         )
         .await
         .unwrap();
+        // Preserve a legacy encrypted account object without loading or applying it.
+        let vault = Vault::open(&session.connection).unwrap();
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&vault.key).unwrap();
+        mac.update(&vault.aad("object-id"));
+        mac.update(&serde_json::to_vec(&("account", "1")).unwrap());
+        let id = hex::encode(mac.finalize().into_bytes());
+        let ciphertext = vault
+            .encrypt(
+                &id,
+                &serde_json::to_vec(&serde_json::json!({
+                    "kind":"account", "id":"1", "value":"Retired private account label"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        raw_request(
+            &session,
+            ControlRequest::PrivatePut {
+                id,
+                ciphertext: Some(ciphertext),
+            },
+        )
+        .await
+        .unwrap();
+        let oauth_vault = local.vault.clone();
+        local
+            .db
+            .call(move |conn| {
+                crate::oauth::save(
+                    conn,
+                    &oauth_vault,
+                    "synthetic",
+                    &crate::oauth::Credentials {
+                        access_token: "synthetic".into(),
+                        refresh_token: "synthetic".into(),
+                    },
+                    i64::MAX,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let report = request(&session, ControlRequest::Doctor).await.unwrap();
+        assert_eq!(report["quota_accounts"][0]["label"], "Email unavailable");
+        assert!(report["quota_accounts"][0].get("display_name").is_none());
+        assert!(!report.to_string().contains("Retired private account label"));
+        local.disable(1).await.unwrap();
         let restored = dashboard(&session).await.unwrap().unwrap();
         assert_eq!(
             (
@@ -861,27 +819,6 @@ mod tests {
         .unwrap()["revoked"]
             .as_bool()
             .unwrap());
-        let vault = Vault::open(&session.connection).unwrap();
-        let id = vault.object_id(Kind::Account, "1").unwrap();
-        let ciphertext = vault
-            .encrypt(
-                &id,
-                &serde_json::to_vec(&Object {
-                    kind: Kind::Account,
-                    id: "1".into(),
-                    value: "Private account label".into(),
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        let objects = serde_json::json!({id:ciphertext});
-        let mut reply =
-            serde_json::json!({"quota_accounts":[{"id":1,"label":"Issuer label","quota":{}}]});
-        decorate(&vault, &objects, &mut reply).unwrap();
-        assert_eq!(
-            reply["quota_accounts"][0]["display_name"],
-            "Private account label"
-        );
         local.stop().await.unwrap();
     }
     #[test]

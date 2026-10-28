@@ -873,17 +873,14 @@ async fn select_context_account(
     upstream: &crate::upstream::Upstream,
     model: &str,
     session: Option<&str>,
-    user: i64,
     owner: Option<i64>,
     payload: &Value,
 ) -> std::result::Result<crate::upstream::Selection, crate::upstream::SelectError> {
     if !payload["conversation"].is_null() {
         let id = owner.ok_or(crate::upstream::SelectError::UpstreamUnavailable)?;
-        upstream.select_pinned_for_user(model, id, Some(user)).await
+        upstream.select_pinned(model, id).await
     } else {
-        upstream
-            .select_continuation(model, session, user, owner)
-            .await
+        upstream.select_continuation(model, session, owner).await
     }
 }
 
@@ -1157,7 +1154,6 @@ pub(super) async fn http(
         &upstream,
         &model,
         cache.preferred.then_some(cache.session.as_str()),
-        identity.user_id,
         owner,
         &payload,
     )
@@ -1377,15 +1373,14 @@ pub(super) async fn http(
                     && payload["conversation"].is_null()
                     && quota_refusal(&refusal)
                     && upstream
-                        .account_enabled(identity.user_id, account.info.id)
+                        .account_enabled(account.info.id)
                         .await
                         .unwrap_or(false)
                 {
                     excluded.push(account.info.id);
                     if excluded.len() < 4 {
-                        if let Ok(alternate) = upstream
-                            .select_excluding(&model, None, Some(identity.user_id), &excluded)
-                            .await
+                        if let Ok(alternate) =
+                            upstream.select_excluding(&model, None, &excluded).await
                         {
                             if let Err(err) = transfer_context(
                                 &state,
@@ -2653,7 +2648,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
             'migration: {
                 if let Some(bound) = &binding {
                     let id = bound.account.info.id;
-                    let disabled = match upstream.account_enabled(identity.user_id, id).await {
+                    let disabled = match upstream.account_enabled(id).await {
                         Ok(enabled) => !enabled,
                         Err(_) => {
                             let _ = send_client(
@@ -2666,24 +2661,15 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     };
                     if disabled
                         || upstream.quota_exhausted(id).await.unwrap_or(false)
+                        || upstream.threshold_reached(id).await.unwrap_or(false)
                         || upstream
-                            .threshold_reached(identity.user_id, id)
-                            .await
-                            .unwrap_or(false)
-                        || upstream
-                            .routing_preempted(&model, identity.user_id, id)
+                            .routing_preempted(&model, id)
                             .await
                             .unwrap_or(false)
                     {
-                        if let Ok(account) = select_context_account(
-                            &upstream,
-                            &model,
-                            None,
-                            identity.user_id,
-                            Some(id),
-                            &payload,
-                        )
-                        .await
+                        if let Ok(account) =
+                            select_context_account(&upstream, &model, None, Some(id), &payload)
+                                .await
                         {
                             if account.info.id != id {
                                 let required =
@@ -2730,7 +2716,6 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                     upstream
                                         .connect_with_quota_fallback(
                                             account,
-                                            identity.user_id,
                                             &model,
                                             (native_session, thread),
                                             &mut affinity::upstream_payload(
@@ -2791,14 +2776,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                                 failure,
                                                 crate::upstream::SocketError::Storage
                                             )
-                                            && upstream
-                                                .select_pinned_for_user(
-                                                    &model,
-                                                    id,
-                                                    Some(identity.user_id),
-                                                )
-                                                .await
-                                                .is_ok() =>
+                                            && upstream.select_pinned(&model, id).await.is_ok() =>
                                     {
                                         if let Some(previous) = previous {
                                             let input = payload["input"]
@@ -2839,7 +2817,6 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     &upstream,
                     &model,
                     cache.preferred.then_some(cache.session.as_str()),
-                    identity.user_id,
                     context,
                     &payload,
                 )
@@ -2901,7 +2878,6 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                 let (account, socket, metadata) = match upstream
                     .connect_with_quota_fallback(
                         account,
-                        identity.user_id,
                         &model,
                         (&cache.identity_session, &cache.thread),
                         &mut affinity::upstream_payload(&payload, &state.key, identity.user_id)
@@ -3015,7 +2991,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                 responses: upstream_responses,
             } = binding.as_mut().expect("initialized binding");
             if !upstream
-                .account_enabled(identity.user_id, account.info.id)
+                .account_enabled(account.info.id)
                 .await
                 .unwrap_or(false)
             {
@@ -3023,7 +2999,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     &mut client,
                     ws_error(
                         "account_disabled",
-                        "this account is deactivated for your user or by the server operator",
+                        "this account is deactivated by the server operator",
                     ),
                 )
                 .await;
@@ -3432,13 +3408,10 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                 let old_id = account.info.id;
                 rejected_accounts.push(old_id);
                 if rejected_accounts.len() < 4
-                    && upstream
-                        .account_enabled(identity.user_id, old_id)
-                        .await
-                        .unwrap_or(false)
+                    && upstream.account_enabled(old_id).await.unwrap_or(false)
                 {
                     if let Ok(alternate) = upstream
-                        .select_excluding(&model, None, Some(identity.user_id), &rejected_accounts)
+                        .select_excluding(&model, None, &rejected_accounts)
                         .await
                     {
                         let recoverable = payload
@@ -3457,7 +3430,6 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                             if let Ok((alternate, socket, metadata)) = upstream
                                 .connect_with_quota_fallback(
                                     alternate,
-                                    identity.user_id,
                                     &model,
                                     (
                                         upstream_identity_session

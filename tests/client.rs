@@ -26,7 +26,6 @@ case "$request" in
   *'"action":"token_list"'*) printf '%s' '{"ok":true,"result":[{"id":"tok_test","name":"Laptop","expires_at":2000000000,"revoked_at":null,"last_used_at":null}]}' ;;
   *'"action":"models"'*) printf '%s' '{"ok":true,"result":{"data":[{"id":"gpt-test","object":"model","owned_by":"openai","display_name":"Test model","exetrouter":{"context_window":100000,"input_modalities":["text","image"],"supported_reasoning_levels":[{"effort":"low"}],"default_reasoning_level":"low"}},{"id":"gpt-other","object":"model","owned_by":"openai","display_name":"Other model","exetrouter":{"context_window":200000,"input_modalities":["text"],"supported_reasoning_levels":[{"effort":"high"}]}}]}}' ;;
   *'"action":"doctor"'*|*'"action":"limits"'*) printf '%s' '{"ok":true,"result":{"capabilities":{"account_routing_rules":1},"quota_accounts":[{"id":1,"label":"test@example.com","preference":{"enabled":true,"priority":1,"locked":false,"rules":{"switch_at":null,"switch_at_short":null,"switch_at_weekly":null},"settings":{}},"reset_credits":{"available_count":2,"credits":[]},"quota":{"status":"current","windows":[{"kind":"primary","window_minutes":480,"used_percent":20,"remaining_percent":80,"status":"current"},{"kind":"secondary","window_minutes":10080,"used_percent":30,"remaining_percent":70,"status":"stale"}]}}]}}' ;;
-  *'"action":"account_set"'*) printf '%s' '{"ok":true,"result":{"enabled":true,"priority":-255,"locked":false,"rules":{"switch_at":20,"switch_at_short":-1,"switch_at_weekly":15},"settings":{"priority":-255,"switch_at":20,"switch_at_short":"off","switch_at_weekly":15}}}' ;;
   *'"action":"usage"'*'"by":"token"'*) printf '%s' '{"ok":true,"result":{"period":"day","timezone":"Europe/Moscow","rows":[{"name":"tok_test","display_name":"Laptop","requests":3,"input_tokens":10,"output_tokens":2}]}}' ;;
   *'"action":"usage"'*) printf '%s' '{"ok":true,"result":{"period":"day","timezone":"Europe/Moscow","rows":[]}}' ;;
   *'"action":"token_create"'*) printf '%s' '{"ok":true,"result":{"token":{"id":"tok_created"},"secret":"SYNTHETIC_TEST_SECRET"}}' ;;
@@ -501,8 +500,7 @@ fn real_terminal_dashboard_copies_secrets_without_rendering_and_restores_screen(
         &mut output,
         "Client activity unavailable on this server.",
     );
-    master.write_all(b"\r").unwrap();
-    wait(&mut master, &mut output, "Deactivate for me");
+    master.write_all(b"\rDL").unwrap();
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()
         .contains("reset_confirm"));
@@ -523,6 +521,7 @@ fn real_terminal_dashboard_copies_secrets_without_rendering_and_restores_screen(
     assert_eq!(requests.matches("token_revoke").count(), 1);
     assert_eq!(requests.matches("reset_prepare").count(), 0);
     assert_eq!(requests.matches("reset_confirm").count(), 0);
+    assert_eq!(requests.matches("account_set").count(), 0);
     assert!(!requests.contains("Test service"));
     assert!(requests.contains("exrp1:"));
     let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -772,7 +771,7 @@ impl Drop for Dashboard {
 fn dashboard_renames_from_actions_and_cancels_or_rejects_empty_edits() {
     let client = Client::configured();
     let mut dashboard = Dashboard::start(client.command());
-    dashboard.wait("Actions Enter");
+    dashboard.wait("Details Enter");
     dashboard.send(b"3");
     dashboard.wait("TOKEN INFORMATION");
     dashboard.send(b"\r");
@@ -848,7 +847,7 @@ fn dashboard_enter_copies_the_selected_model_and_usage_requests_last_24_hours() 
 fn dashboard_help_accepts_slash_and_russian_layout_punctuation() {
     let client = Client::configured();
     let mut dashboard = Dashboard::start(client.command());
-    dashboard.wait("Actions Enter");
+    dashboard.wait("Details Enter");
     for shortcut in [
         b"/".as_slice(),
         b"?".as_slice(),
@@ -858,7 +857,7 @@ fn dashboard_help_accepts_slash_and_russian_layout_punctuation() {
         dashboard.send(shortcut);
         dashboard.wait("Keyboard help");
         dashboard.dismiss("Keyboard help");
-        dashboard.wait("Actions Enter");
+        dashboard.wait("Details Enter");
     }
     dashboard.quit_with("й".as_bytes());
 }
@@ -1226,8 +1225,59 @@ fn opencode_exports_reuse_saved_api_url_and_select_only_catalog_models() {
 }
 
 #[test]
-fn account_cli_rejects_retired_rules_and_manual_redemption_before_mutation() {
+fn standalone_account_disable_changes_oauth_state_without_personal_preferences() {
+    let client = Client::new();
+    let state = client.dir.path().join("standalone");
+    let prefix = ["--standalone", "--state-dir", state.to_str().unwrap()];
+    let run = |arguments: &[&str]| {
+        let mut command = client.command();
+        command.args(prefix).args(arguments).output().unwrap()
+    };
+    assert!(run(&["account", "list", "--json"]).status.success());
+    let conn = rusqlite::Connection::open(state.join("state.sqlite")).unwrap();
+    conn.execute("INSERT INTO oauth_accounts(account_id,state,encrypted_credentials,expires_at,created_at) VALUES('synthetic','active',X'1234',2000000000,0)", []).unwrap();
+    let output = run(&["account", "disable", "1", "--yes", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"disabled":true})
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state,hex(encrypted_credentials) FROM oauth_accounts",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        )
+        .unwrap(),
+        ("disabled".into(), "1234".into())
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM account_preferences", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(!client.dir.path().join("requests.log").exists());
+}
+
+#[test]
+fn account_cli_rejects_personal_availability_rules_and_manual_redemption_before_mutation() {
     let client = Client::configured();
+    for arguments in [
+        vec!["account", "set", "1", "--enabled", "false"],
+        vec!["account", "enable", "1"],
+        vec!["account", "disable", "1", "--yes"],
+    ] {
+        assert!(!client.run(&arguments).status.success());
+    }
+    let help = client.run(&["account", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(!help.contains("enable"));
+    assert!(!help.contains("set "));
     let output = client.run(&[
         "account",
         "set",
@@ -1263,7 +1313,7 @@ fn dashboard_retired_routing_shortcuts_do_not_mutate() {
     let mut dashboard = Dashboard::start(client.command());
     dashboard.wait("Automatic");
     std::thread::sleep(std::time::Duration::from_millis(200));
-    dashboard.send(b"SPc");
+    dashboard.send(b"SPcDL");
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()
         .contains("account_set"));
@@ -1280,7 +1330,7 @@ fn unsupported_remote_rules_are_explained_without_sending_a_mutation() {
     fs::write(&path, script).unwrap();
     let output = client.run(&["account", "set", "1", "--switch-at", "20"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
     let mut dashboard = Dashboard::start(client.command());
     dashboard.wait("Automatic");
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1289,19 +1339,12 @@ fn unsupported_remote_rules_are_explained_without_sending_a_mutation() {
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()
         .contains("account_set"));
-    assert!(client
+    assert!(!client
         .run(&["account", "set", "1", "--enabled", "false"])
         .status
         .success());
     let requests = fs::read_to_string(client.dir.path().join("requests.log")).unwrap();
-    let mutation: serde_json::Value = serde_json::from_str(
-        requests
-            .lines()
-            .find(|line| line.contains("account_set"))
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(mutation.get("routing").is_none());
+    assert!(!requests.contains("account_set"));
 }
 
 #[test]
@@ -1315,9 +1358,11 @@ fn dashboard_operator_activation_lock_cannot_be_bypassed() {
     let mut dashboard = Dashboard::start(client.command());
     dashboard.wait("Locked");
     std::thread::sleep(std::time::Duration::from_millis(200));
-    dashboard.send(b"D");
-    dashboard.wait("Account settings locked");
-    dashboard.dismiss("Account settings locked");
+    dashboard.send(b"DL");
+    dashboard.send(b"\r");
+    dashboard.wait("Account details");
+    dashboard.send(b"\rDL");
+    dashboard.dismiss("Account details");
     dashboard.quit();
     assert!(!fs::read_to_string(client.dir.path().join("requests.log"))
         .unwrap()

@@ -1312,7 +1312,7 @@ async fn payloads_are_absent_from_real_process_logs_and_state_even_with_trace_re
 }
 
 #[test]
-fn restricted_gateway_rejects_retired_routing_and_manual_resets_but_keeps_activation_locks() {
+fn restricted_gateway_rejects_personal_availability_routing_and_manual_resets() {
     let server = Server::start();
     let conn = rusqlite::Connection::open(server.dir.path().join("state.sqlite")).unwrap();
     let now = chrono::Utc::now().timestamp();
@@ -1323,6 +1323,8 @@ fn restricted_gateway_rejects_retired_routing_and_manual_resets_but_keeps_activa
         json!({"action":"reset_prepare","account":1}),
         json!({"action":"reset_confirm","confirmation":"synthetic"}),
         json!({"action":"account_set","account":1,"priority":255}),
+        json!({"action":"account_set","account":1,"enabled":false}),
+        json!({"action":"account_set","account":1,"enabled":true}),
     ] {
         assert_eq!(server.control(request)["ok"], false);
     }

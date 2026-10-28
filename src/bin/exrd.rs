@@ -152,11 +152,12 @@ enum BackupCommand {
 enum OauthCommand {
     /// Create the OAuth encryption key for an existing pre-OAuth installation.
     InitKey,
-    /// Set reversible availability for everyone and lock client activation changes.
+    /// Set reversible availability for everyone (OAuth must remain healthy).
     Policy {
         id: i64,
         #[arg(long, action=clap::ArgAction::Set)]
         enabled: Option<bool>,
+        /// Preserve the operator lock marker for older clients and rollback.
         #[arg(long, action=clap::ArgAction::Set)]
         locked: Option<bool>,
     },
@@ -173,9 +174,9 @@ enum OauthCommand {
     },
     /// List account state and expiry without credentials.
     List,
-    /// Reversibly deactivate routing for everyone and lock client changes.
+    /// Reversibly deactivate routing for everyone; retain OAuth state.
     Disable { id: i64 },
-    /// Reactivate routing for everyone; existing lock remains in effect.
+    /// Reactivate routing for everyone; preserve the legacy lock marker.
     Enable { id: i64 },
 }
 
@@ -439,7 +440,7 @@ async fn run() -> Result<()> {
                         for row in &mut rows {
                             if let Some(id) = row["id"].as_i64() {
                                 row["routing_policy"] = serde_json::to_value(
-                                    exetrouter::account_preferences::effective(conn, None, id)?,
+                                    exetrouter::account_preferences::effective(conn, id)?,
                                 )?;
                             }
                         }

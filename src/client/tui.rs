@@ -68,7 +68,7 @@ fn shortcut_key(mut key: KeyEvent) -> KeyEvent {
 fn command_input(state: &State) -> bool {
     !matches!(
         state.modal,
-        Some(Modal::Name(_) | Modal::Rename { .. } | Modal::Days { .. } | Modal::Personal { .. })
+        Some(Modal::Name(_) | Modal::Rename { .. } | Modal::Days { .. })
     )
 }
 
@@ -117,7 +117,7 @@ fn dashboard_buttons(state: &State) -> Vec<(&'static str, KeyCode)> {
             ("Create token", KeyCode::Char('n')),
         ],
         SETTINGS => vec![],
-        _ => vec![("Actions", KeyCode::Enter)],
+        _ => vec![("Details", KeyCode::Enter)],
     };
     entries.extend([
         ("Refresh", KeyCode::Char('r')),
@@ -210,9 +210,7 @@ fn mouse_key(mouse: MouseEvent, hits: &[Hit], state: &mut State) -> Option<KeyEv
                     KeyCode::Enter
                 }
                 MouseAction::Cursor => {
-                    if let Some(Modal::Personal { input, .. } | Modal::Rename { input, .. }) =
-                        &mut state.modal
-                    {
+                    if let Some(Modal::Rename { input, .. }) = &mut state.modal {
                         input.place_cursor(mouse.column.saturating_sub(hit.area.x) as usize);
                     }
                     return None;
@@ -285,21 +283,12 @@ enum Modal {
         entries: Vec<(String, KeyCode)>,
         selected: usize,
     },
-    Error {
-        title: &'static str,
-        message: String,
-    },
     UpdateConfirm,
     Name(String),
     Rename {
         id: String,
         input: TextInput,
         error: String,
-    },
-    Personal {
-        kind: super::privacy::Kind,
-        id: String,
-        input: TextInput,
     },
     Days {
         name: String,
@@ -403,8 +392,8 @@ fn start(connection: &Connection, req: ControlRequest, tab: usize, mutation: boo
     Pending {
         task: tokio::spawn(async move {
             if tab == SETTINGS && !mutation {
-                let accounts = if session.connection.local.is_some() {
-                    super::privacy::local_accounts(&session).await?
+                let accounts = if let Some(local) = &session.connection.local {
+                    local.accounts().await?
                 } else {
                     ssh_request(&session, ControlRequest::Doctor).await?
                 };
@@ -711,13 +700,7 @@ fn settings_lines(connection: &Connection, state: &State, width: u16) -> Vec<Lin
                     format!(
                         "{}{}",
                         if selected { "▶ " } else { "  " },
-                        render::safe(
-                            account
-                                .get("display_name")
-                                .unwrap_or(&account["email"])
-                                .as_str()
-                                .unwrap_or("Email unavailable")
-                        )
+                        render::safe(account["email"].as_str().unwrap_or("Email unavailable"))
                     ),
                     if selected {
                         selection_style()
@@ -770,45 +753,6 @@ fn account_detail_text(state: &State, id: i64) -> String {
 }
 fn action_menu(state: &State, _connection: &Connection) -> (String, Vec<(String, KeyCode)>) {
     let entries = match state.tab {
-        OVERVIEW => {
-            let Some(row) = state.values[OVERVIEW]
-                .as_ref()
-                .and_then(|v| v["quota_accounts"].as_array())
-                .and_then(|r| r.get(state.account_selected))
-            else {
-                return ("Account unavailable".into(), vec![]);
-            };
-            let mut entries = vec![];
-            if row["preference"]["locked"].as_bool() != Some(true) {
-                entries.push((
-                    if row["preference"]["enabled"].as_bool() == Some(false) {
-                        "Activate for me"
-                    } else {
-                        "Deactivate for me"
-                    }
-                    .into(),
-                    KeyCode::Char('D'),
-                ));
-            }
-            entries.push(("Edit personal account label".into(), KeyCode::Char('L')));
-            return (
-                format!(
-                    "{}{}",
-                    render::safe(
-                        row.get("display_name")
-                            .unwrap_or(&row["label"])
-                            .as_str()
-                            .unwrap_or("Account")
-                    ),
-                    if row["preference"]["locked"].as_bool() == Some(true) {
-                        " · Locked by operator"
-                    } else {
-                        ""
-                    }
-                ),
-                entries,
-            );
-        }
         TOKENS => {
             let mut entries = vec![("Create token".into(), KeyCode::Char('n'))];
             if state.values[TOKENS]
@@ -1162,15 +1106,9 @@ fn render_hits(
 
     if let Some(modal) = &state.modal {
         footer = vec![match modal {
-            Modal::Account { .. } => keys(&[
-                ("↑ / ↓", "scroll"),
-                ("PgUp / PgDn", "page"),
-                ("r", "refresh"),
-            ]),
+            Modal::Account { .. } => keys(&[("↑ / ↓", "scroll"), ("PgUp / PgDn", "page")]),
             Modal::Actions { .. } => keys(&[("↑ / ↓", "select")]),
-            Modal::Personal { .. } | Modal::Rename { .. } => {
-                keys(&[("← / →", "cursor"), ("Ctrl-U", "clear")])
-            }
+            Modal::Rename { .. } => keys(&[("← / →", "cursor"), ("Ctrl-U", "clear")]),
             _ => Line::default(),
         }];
     }
@@ -1286,11 +1224,9 @@ fn render_hits(
         let (title,text) = match modal {
             Modal::Account { id, .. } => ("Account details", account_detail_text(state,*id)),
             Modal::Actions { title, entries, selected } => (title.as_str(), entries.iter().enumerate().map(|(i,(name,key))|format!("{}{} {}",if i==*selected {"▶ "}else{"  "},name,shortcut_label(*key))).collect::<Vec<_>>().join("\n")),
-            Modal::Error { title, message } => (*title, message.clone()),
             Modal::UpdateConfirm => ("Update exr", "Install the latest published release in the existing installation?\nThe installation method is preserved; config, accounts and tokens stay in place.\nSource builds may take several minutes. Restart exr after completion.".into()),
             Modal::Name(text) => ("Create token",format!("Token name: {text}")),
             Modal::Rename { input, error, .. } => ("Rename token", format!("{}\n\n{error}", input.value)),
-            Modal::Personal {kind,input,..} => (match kind {super::privacy::Kind::Account=>"Account label",super::privacy::Kind::Settings=>"Preferences"},input.value.clone()),
             Modal::Days { name,text } => ("Create token",format!("Name: {name}\nExpires in days (1–365): {text}")),
             Modal::Confirm { id,rotate } => (if *rotate {"Rotate token"}else{"Revoke token"}, format!("Token: {id}\n{}",if *rotate {"The old secret will stop working. The new secret will be copied to the clipboard."}else{"This token will stop working immediately."})),
             Modal::ClipboardRetry { .. } => ("Clipboard unavailable", "The token was issued, but copying failed.\nThe secret stays hidden. No token request will be repeated.\nDiscarding it requires rotating the token later.".into()),
@@ -1309,15 +1245,11 @@ fn render_hits(
         area.height = needed as u16;
         area.y = frame.area().y + (frame.area().height - area.height) / 2;
         frame.render_widget(Clear, area);
-        let error = matches!(modal, Modal::Error { .. });
-        let mut title = title_line(title);
-        if error {
-            title.spans[1].style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-        }
+        let title = title_line(title);
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(if error { Color::Red } else { Color::Cyan }));
+            .border_style(Style::default().fg(Color::Cyan));
         if let Modal::Account { scroll, .. } = modal {
             frame.render_widget(block, area);
             let content = Rect::new(
@@ -1362,7 +1294,7 @@ fn render_hits(
                     y += height;
                 }
             }
-            Modal::Personal { input, .. } | Modal::Rename { input, .. }
+            Modal::Rename { input, .. }
                 if Line::from(input.value.as_str()).width()
                     <= area.width.saturating_sub(2) as usize =>
             {
@@ -1374,7 +1306,7 @@ fn render_hits(
             _ => {}
         }
         let controls: &[(&str, KeyCode)] = match modal {
-            Modal::Account { .. } => &[("Actions", KeyCode::Enter), ("Close", KeyCode::Esc)],
+            Modal::Account { .. } => &[("Refresh", KeyCode::Char('r')), ("Close", KeyCode::Esc)],
             Modal::Confirm { rotate: true, .. } => &[
                 ("Rotate token", KeyCode::Char('y')),
                 ("Cancel", KeyCode::Esc),
@@ -1387,12 +1319,10 @@ fn render_hits(
                 ("Retry copy", KeyCode::Char('c')),
                 ("Discard", KeyCode::Esc),
             ],
-            Modal::Error { .. } | Modal::Help => &[("Close", KeyCode::Esc)],
+            Modal::Help => &[("Close", KeyCode::Esc)],
             Modal::Actions { .. } => &[("Close", KeyCode::Esc)],
             Modal::UpdateConfirm => &[("Update", KeyCode::Enter), ("Cancel", KeyCode::Esc)],
-            Modal::Personal { .. } | Modal::Rename { .. } => {
-                &[("Save", KeyCode::Enter), ("Cancel", KeyCode::Esc)]
-            }
+            Modal::Rename { .. } => &[("Save", KeyCode::Enter), ("Cancel", KeyCode::Esc)],
             Modal::Days { .. } => &[("Create token", KeyCode::Enter), ("Cancel", KeyCode::Esc)],
             _ => &[("Continue", KeyCode::Enter), ("Cancel", KeyCode::Esc)],
         };
@@ -1407,7 +1337,7 @@ fn render_hits(
             controls,
             &mut hits,
         );
-        if let Modal::Personal { input, .. } | Modal::Rename { input, .. } = modal {
+        if let Modal::Rename { input, .. } = modal {
             if Line::from(input.value.as_str()).width() <= area.width.saturating_sub(2) as usize {
                 frame.set_cursor_position((
                     area.x + 1 + Line::from(&input.value[..input.cursor]).width() as u16,
@@ -1549,13 +1479,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) {
     for (index, account) in accounts.into_iter().enumerate() {
         let label = format!(
             "{}{}",
-            render::safe(
-                account
-                    .get("display_name")
-                    .unwrap_or(&account["label"])
-                    .as_str()
-                    .unwrap_or("Account")
-            ),
+            render::safe(account["label"].as_str().unwrap_or("Account")),
             if account["preference"]["enabled"].as_bool() == Some(false) {
                 " · Deactivated"
             } else {
@@ -1968,7 +1892,7 @@ fn usage_chart(frame: &mut Frame<'_>, area: Rect, state: &State, value: &Value) 
 }
 fn keyboard_help(state: &State, connection: &Connection) -> String {
     let actions = match state.tab {
-        OVERVIEW => "↑/↓: select account\nPgUp/PgDn: page\nEnter: account actions, routing details and clients\nD: toggle activation; L: personal label\nRouting and expiring reset credits are automatic. Operator activation locks apply.",
+        OVERVIEW => "↑/↓: select account\nPgUp/PgDn: page\nEnter: routing details and clients\nRouting and expiring reset credits are automatic. Account availability is managed by the operator.",
         USAGE if state.group == 0 => "p: change period\nb: change grouping\nm: switch tokens / requests",
         USAGE => "↑/↓: select user, model or token with recorded usage\np: change period\nb: change grouping\nm: switch tokens / requests",
         TOKENS => "↑/↓: select token\nEnter: token actions\nn: create; l: rename; o: rotate; x: revoke\nRotation and revocation require confirmation.",
@@ -1976,7 +1900,7 @@ fn keyboard_help(state: &State, connection: &Connection) -> String {
         SETTINGS if connection.local.is_some() => "↑/↓: select settings actions or account\nEnter: activate selected action; reauthorize selected account\ne: configure connection; v: check updates; U: update\na: add account; u: reauthorize; d: disable",
         _ => "↑/↓: select settings actions\nEnter: activate selected action\ne: configure connection; v: check updates; U: update",
     };
-    format!("{}\n\n←/→ or 1–5: switch views\nr: refresh this view\n? or /: help\nq / Ctrl-C: quit\n\nClick accounts to open actions. Wheel selects items.\nEN/RU shortcuts work without changing typed text.\nShift + drag usually selects terminal text.\n\n{actions}", TABS[state.tab])
+    format!("{}\n\n←/→ or 1–5: switch views\nr: refresh this view\n? or /: help\nq / Ctrl-C: quit\n\nClick accounts to open details. Wheel selects items.\nEN/RU shortcuts work without changing typed text.\nShift + drag usually selects terminal text.\n\n{actions}", TABS[state.tab])
 }
 
 fn popup(area: Rect) -> Rect {
@@ -2048,10 +1972,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                 next_limits_refresh = Instant::now() + LIMIT_REFRESH_INTERVAL;
             }
             match result {
-                Ok(_value) if job.mutation && job.tab == OVERVIEW => {
-                    state.notices[OVERVIEW]=Some("Account preferences saved.".into());
-                    pending=Some(start(&args.connection,ControlRequest::Limits,OVERVIEW,false));
-                }
                 Ok(mut value) if job.mutation => {
                     if job.tab == TOKENS {
                         // Usage labels are resolved when the report is loaded.
@@ -2069,7 +1989,7 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                             return Err("token issued without a clipboard destination; rotate it before use".into());
                         }
                     } else if value.get("updated").and_then(Value::as_bool) == Some(true) {
-                        state.notices[job.tab] = Some(if job.tab == TOKENS { "Token label saved." } else { "Personal data saved." }.into());
+                        state.notices[job.tab] = Some("Token label saved.".into());
                     } else {
                         state.notices[job.tab] = Some(render::response("revoke", &value));
                     }
@@ -2209,14 +2129,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
             match modal {
                 Modal::Account { id, scroll } => match key.code {
                     KeyCode::Esc => state.modal = None,
-                    KeyCode::Enter => {
-                        let account=*id;
-                        if let Some(index)=state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|rows|rows.iter().position(|r|r["id"].as_i64()==Some(account))) {
-                            state.account_selected=index;
-                            let (title,entries)=action_menu(&state,&args.connection);
-                            state.modal=Some(Modal::Actions{title,entries,selected:0});
-                        } else {state.modal=None;}
-                    }
                     KeyCode::Down | KeyCode::PageDown => {
                         let step=if key.code==KeyCode::PageDown {10} else {1};
                         let account=*id;
@@ -2231,11 +2143,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                     _ => {}
                 },
                 Modal::Actions { .. } => unreachable!("action menus handled above"),
-                Modal::Error { .. } => {
-                    if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                        state.modal = None;
-                    }
-                }
                 Modal::UpdateConfirm => match key.code {
                     KeyCode::Esc | KeyCode::Char('n') => state.modal = None,
                     KeyCode::Enter | KeyCode::Char('y') => {
@@ -2292,17 +2199,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                         })
                     }
                     _ => {}
-                },
-                Modal::Personal {kind,id,input} => match key.code {
-                    KeyCode::Esc => state.modal=None,
-                    KeyCode::Enter => {
-                        match super::privacy::seal(&args.connection,*kind,id,&input.value) {
-                            Ok(request)=>{mutation=Some(request);},
-                            Err(error)=>state.statuses[state.tab]=error.to_string(),
-                        }
-                        state.modal=None;
-                    }
-                    _=>input.edit(key),
                 },
                 Modal::Rename { id, input, error } => match key.code {
                     KeyCode::Esc => state.modal = None,
@@ -2501,23 +2397,6 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                         state.modal=Some(Modal::Actions{title,entries,selected:0});
                     }
                 }
-                KeyCode::Char('D') if state.tab == OVERVIEW => {
-                    if let Some(row)=state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|r|r.get(state.account_selected)) {
-                        if row["preference"]["locked"] == true {
-                            state.modal = Some(Modal::Error {title:"Account settings locked",message:"Account settings are locked by the server operator.".into()});
-                        } else if let Some(account)=row["id"].as_i64() {
-                            mutation=Some(ControlRequest::AccountSet{account, enabled:Some(!row["preference"]["enabled"].as_bool().unwrap_or(true)), priority:None,routing:None});
-                        }
-                    }
-                }
-                KeyCode::Char('L') if state.tab == OVERVIEW => {
-                    if let Some(row)=state.values[OVERVIEW].as_ref().and_then(|v|v["quota_accounts"].as_array()).and_then(|r|r.get(state.account_selected)) {
-                        if let Some(id)=row["id"].as_i64() {
-                            let value=row["display_name"].as_str().unwrap_or("").to_owned();
-                            state.modal=Some(Modal::Personal {kind:super::privacy::Kind::Account,id:id.to_string(),input:TextInput::new(value)});
-                        }
-                    }
-                }
                 KeyCode::Char('n') if state.tab == TOKENS => {
                     state.modal = Some(Modal::Name(String::new()))
                 }
@@ -2628,14 +2507,7 @@ pub(super) async fn run(original: &Session, config_path: &std::path::Path) -> Re
                 }
             }
             state.notices[state.tab] = None;
-            let tab = if matches!(req, ControlRequest::AccountSet { .. }) {
-                OVERVIEW
-            } else if matches!(req,ControlRequest::PrivatePut {..}) {
-                state.tab
-            } else {
-                TOKENS
-            };
-            pending = Some(start(&args.connection, req, tab, true));
+            pending = Some(start(&args.connection, req, TOKENS, true));
         }
     }
     }.await;
@@ -2660,12 +2532,7 @@ fn settings_body(connection: &Connection, accounts: Option<&Value>, selected: us
             text.push_str(&format!(
                 "{}{} · {}\n",
                 if i == selected { "▶ " } else { "  " },
-                render::safe(
-                    row.get("display_name")
-                        .unwrap_or(&row["email"])
-                        .as_str()
-                        .unwrap_or("Email unavailable")
-                ),
+                render::safe(row["email"].as_str().unwrap_or("Email unavailable")),
                 render::safe(row["state"].as_str().unwrap_or("unknown"))
             ));
         }
@@ -3100,11 +2967,6 @@ mod tests {
                 input: TextInput::new(String::new()),
                 error: String::new(),
             },
-            Modal::Personal {
-                kind: super::super::privacy::Kind::Account,
-                id: "fixture".into(),
-                input: TextInput::new(String::new()),
-            },
         ] {
             let state = State {
                 modal: Some(modal),
@@ -3405,16 +3267,22 @@ mod tests {
     }
 
     #[test]
-    fn account_actions_have_no_manual_routing_or_redemption() {
+    fn account_details_have_no_mutation_menu() {
         let mut state = State::default();
         state.values[OVERVIEW] = Some(
             serde_json::json!({"quota_accounts":[{"id":1,"preference":{"enabled":true,"locked":false}}]}),
         );
         let (_, actions) = action_menu(&state, &Connection::default());
-        assert_eq!(
-            actions.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
-            [KeyCode::Char('D'), KeyCode::Char('L')]
-        );
+        assert!(actions.is_empty());
+        state.modal = Some(Modal::Account { id: 1, scroll: 0 });
+        let hits = dashboard_hits(&state, 120, 40);
+        assert!(hits
+            .iter()
+            .any(|hit| hit.action == MouseAction::Key(KeyCode::Char('r'))));
+        assert!(!hits.iter().any(|hit| matches!(
+            hit.action,
+            MouseAction::Menu(_) | MouseAction::Key(KeyCode::Enter | KeyCode::Char('D' | 'L'))
+        )));
     }
     #[test]
     fn connection_input_edits_unicode_at_the_cursor_and_scrolls() {
@@ -3459,7 +3327,7 @@ mod tests {
     fn keyboard_help_only_shows_current_tab_actions() {
         let connection = Connection::default();
         for (tab, action) in [
-            (OVERVIEW, "account actions"),
+            (OVERVIEW, "routing details and clients"),
             (USAGE, "change grouping"),
             (TOKENS, "token actions"),
             (MODELS, "copy selected model ID"),
@@ -3473,7 +3341,7 @@ mod tests {
             assert!(text.contains(action));
             assert!(text.starts_with(TABS[tab]));
             for other in [
-                "account actions",
+                "routing details and clients",
                 "change grouping",
                 "token actions",
                 "copy selected model ID",
@@ -3776,7 +3644,7 @@ mod tests {
         select_item(&mut state, false, 10, 66);
         assert_eq!(state.scroll, 0);
         select_item(&mut state, true, 10, 66);
-        assert!(text.contains("Actions Enter"));
+        assert!(text.contains("Details Enter"));
         assert!(!text.contains("Enter: account actions"));
         assert!(!text.contains("Subscription limits"));
         let mut refreshed = state.values[OVERVIEW].clone().unwrap();
@@ -3869,7 +3737,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("Account details"));
         assert!(text.contains("Laptop - Codex"));
-        assert!(text.contains("Actions Enter"));
+        assert!(text.contains("Refresh r"));
         state.values[OVERVIEW].as_mut().unwrap()["quota_accounts"][0]["routing"]["observed_at"] =
             (now - 60).into();
         assert!(!render::best_account(

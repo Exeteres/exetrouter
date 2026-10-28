@@ -274,17 +274,7 @@ pub(super) fn limits(v: &Value) -> String {
         text.push_str("No account quota observations available.\n");
     }
     for account in &accounts {
-        text.push_str(&format!(
-            "{}\n",
-            field(
-                account,
-                if account.get("display_name").is_some() {
-                    "display_name"
-                } else {
-                    "label"
-                }
-            )
-        ));
+        text.push_str(&format!("{}\n", field(account, "label")));
         if account["preference"].is_object() {
             let routing = account_routing(account);
             if !routing.is_empty() {
@@ -409,7 +399,7 @@ fn routing_current(account: &Value, now: i64) -> bool {
 }
 
 pub(super) fn account_details(account: &Value, now: i64) -> String {
-    let label = account.get("display_name").unwrap_or(&account["label"]);
+    let label = &account["label"];
     let mut text = format!("{}\n\n", safe(label.as_str().unwrap_or("Account")));
     let fresh = routing_current(account, now);
     if best_account(account, now) {
@@ -509,14 +499,7 @@ pub(super) fn accounts(value: &Value) -> String {
             .map(|row| {
                 format!(
                     "{} (ID {}) - {}",
-                    field(
-                        row,
-                        if row.get("display_name").is_some() {
-                            "display_name"
-                        } else {
-                            "email"
-                        }
-                    ),
+                    field(row, "email"),
                     field(row, "id"),
                     field(row, "state")
                 )
