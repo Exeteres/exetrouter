@@ -1,5 +1,5 @@
 //! Decode native HTTP bodies after authentication, before JSON extraction.
-use super::{error, AppState, RequestId, MAX_INFERENCE_REQUEST_BYTES};
+use super::{error, AppState, RequestId};
 use axum::{
     body::Body,
     extract::Request,
@@ -19,7 +19,7 @@ const DECODE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, PartialEq)]
 enum Failure {
     Invalid,
-    Large,
+    Resources,
     Timeout,
 }
 
@@ -58,9 +58,7 @@ fn decode(wire: &[u8]) -> Result<Vec<u8>, Failure> {
         if count == 0 {
             return Ok(output);
         }
-        if output.len() + count > MAX_INFERENCE_REQUEST_BYTES {
-            return Err(Failure::Large);
-        }
+        output.try_reserve(count).map_err(|_| Failure::Resources)?;
         output.extend_from_slice(&chunk[..count]);
     }
 }
@@ -100,30 +98,29 @@ pub(super) async fn prepare(state: &Arc<AppState>, request: Request) -> Result<R
         let mut wire = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| Failure::Invalid)?;
-            if wire.len() + chunk.len() > MAX_INFERENCE_REQUEST_BYTES {
-                return Err(Failure::Large);
-            }
+            wire.try_reserve(chunk.len())
+                .map_err(|_| Failure::Resources)?;
             wire.extend_from_slice(&chunk);
         }
-        Ok(wire)
+        Ok::<_, Failure>(wire)
     })
     .await
     {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(failure)) => {
-            let large = failure == Failure::Large;
+            let resources = failure == Failure::Resources;
             return Err(reject(
-                if large {
-                    StatusCode::PAYLOAD_TOO_LARGE
+                if resources {
+                    StatusCode::SERVICE_UNAVAILABLE
                 } else {
                     StatusCode::BAD_REQUEST
                 },
-                if large {
-                    "request_too_large"
+                if resources {
+                    "server_busy"
                 } else {
                     "invalid_request_error"
                 },
-                "compressed request body could not be read within the 128 MiB limit",
+                "compressed request body could not be read",
             ));
         }
         Err(_) => {
@@ -153,10 +150,10 @@ pub(super) async fn prepare(state: &Arc<AppState>, request: Request) -> Result<R
                     "invalid_request_error",
                     "invalid zstd request body",
                 ),
-                Failure::Large => (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_too_large",
-                    "decoded request body exceeds the 128 MiB limit",
+                Failure::Resources => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_busy",
+                    "request decoder memory unavailable",
                 ),
                 Failure::Timeout => (
                     StatusCode::REQUEST_TIMEOUT,
@@ -180,7 +177,7 @@ pub(super) async fn prepare(state: &Arc<AppState>, request: Request) -> Result<R
 mod tests {
     use super::*;
     #[test]
-    fn corrupt_truncated_and_expanding_frames_fail() {
+    fn corrupt_and_truncated_frames_fail() {
         assert_eq!(
             decode(b"synthetic private invalid frame"),
             Err(Failure::Invalid)
@@ -188,8 +185,12 @@ mod tests {
         let frame = zstd::stream::encode_all(&b"{}"[..], 3).unwrap();
         assert_eq!(decode(&frame), Ok(b"{}".to_vec()));
         assert_eq!(decode(&frame[..frame.len() - 1]), Err(Failure::Invalid));
-        let frame =
-            zstd::stream::encode_all(&vec![b' '; MAX_INFERENCE_REQUEST_BYTES + 1][..], 3).unwrap();
-        assert_eq!(decode(&frame), Err(Failure::Large));
+    }
+
+    #[test]
+    fn decoded_input_can_exceed_the_former_byte_ceiling() {
+        let input = vec![b' '; 128 * 1024 * 1024 + 1];
+        let frame = zstd::stream::encode_all(&input[..], 3).unwrap();
+        assert_eq!(decode(&frame).unwrap(), input);
     }
 }

@@ -50,10 +50,6 @@ pub struct ServeConfig {
     pub websockets_per_user: usize,
 }
 
-// Full native-client histories and inline images can exceed the old 1 MiB limit.
-// Keep inference input bounded separately from output and control messages.
-pub(crate) use crate::payload::INFERENCE_REQUEST_BYTES as MAX_INFERENCE_REQUEST_BYTES;
-
 const CONTROL_LIMIT: u64 = 32_768;
 const CONTROL_REPLY_LIMIT: usize = 1_048_576;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -528,7 +524,7 @@ fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(models)
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
-        .layer(DefaultBodyLimit::max(MAX_INFERENCE_REQUEST_BYTES))
+        .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             observe_request,
@@ -770,13 +766,6 @@ async fn model_request(
             tracing::info!(event = "json_request_rejected", request_id = %id.0,
                 status = err.status().as_u16(), rejection_kind, encoding,
                 declared_bytes, surface);
-            if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
-                return error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_too_large",
-                    "request body exceeds the 128 MiB limit",
-                );
-            }
             return error(
                 err.status(),
                 "invalid_request_error",

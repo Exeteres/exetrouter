@@ -49,6 +49,7 @@ pub struct Mock {
     pub idle_pongs: AtomicUsize,
     pub idle_closes: AtomicUsize,
     pub received_pings: AtomicUsize,
+    pub websocket_frame_bytes: AtomicUsize,
     next_response: AtomicUsize,
 }
 
@@ -85,7 +86,7 @@ pub fn router(state: Arc<Mock>) -> Router {
     Router::new()
         .route("/models", get(models))
         .route("/responses", get(websocket).post(responses))
-        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .route("/oauth/token", post(token))
         .route("/api/accounts/deviceauth/usercode", post(device))
         .route("/api/accounts/deviceauth/token", post(device_poll))
@@ -496,9 +497,10 @@ async fn websocket(
             HeaderValue::from_static("private-synthetic-ws-turn-state"),
         );
     }
+    let frame_bytes = state.websocket_frame_bytes.load(Ordering::SeqCst);
     let mut upgrade = ws
-        .max_message_size(128 * 1024 * 1024)
-        .max_frame_size(128 * 1024 * 1024)
+        .max_message_size(usize::MAX)
+        .max_frame_size(if frame_bytes == 0 { usize::MAX } else { frame_bytes })
         .on_upgrade(move |mut socket| async move {
         while let Some(Ok(message)) = socket.next().await {
             match message {
@@ -522,6 +524,13 @@ async fn websocket(
                         state.next_response.fetch_add(1, Ordering::SeqCst) + 1
                     );
                     let mode = mode(&state, &body, &account);
+                    if mode == "message_too_big" {
+                        let _ = socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1009,
+                            reason: "private-synthetic-size-rejection".into(),
+                        }))).await;
+                        return;
+                    }
                     if mode == "liveness_wait" {
                         loop {
                             tokio::select! {

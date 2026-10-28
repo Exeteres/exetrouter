@@ -13,10 +13,16 @@ Reviewed client revisions live in [protocol-sources.json](protocol-sources.json)
 | Responses | `/responses` over HTTP SSE or native WS. `store` defaults false; explicit options pass through for backend validation. |
 | Native WS | `OpenAI-Beta: responses_websockets=2026-02-06`; sequential `response.create`, including `generate=false` warmup; service ping/pong, bound pre-response peer silence to 90 seconds and retire recoverable idle sockets after 30 seconds/five minutes of age before a new submission on the same account. |
 | Compaction | One Responses SSE request ending with `compaction_trigger`; project exactly one opaque checkpoint as `response.compaction`. No separate upstream `/responses/compact`. |
-| Chat | Translate supported HTTP JSON/SSE to Responses. Try WS first; ordinary handshake fallback is allowed only before generation submission. Handshake 401/429 prevents fallback. |
+| Chat | Translate supported HTTP JSON/SSE to Responses. Prefer HTTP for large complete requests; otherwise try WS first. Ordinary handshake fallback is allowed only before generation submission. Handshake 401/429 prevents fallback. |
 | Accounting | Create a durable event before possible submission; retain terminal counters or an explicit unknown outcome. |
 
 Redirects are disabled. Mock upstream requires explicitly enabled literal loopback HTTP. Server-owned headers never forward the client bearer, arbitrary account selection or an arbitrary upstream URL.
+
+The upstream WS handshake offers RFC 7692 `permessage-deflate`, using the exact transport forks pinned by the reviewed Codex 0.164.0 release. Compression is used only after valid negotiation; a declined extension retains plain continuation frames. Decoded upstream event bounds remain independent of the input/context size. See the [targeted source review](native-protocol-audit.md#targeted-websocket-compression-follow-up--october-26-2026); no inference is replayed to negotiate or recover from a size rejection.
+
+Prepared complete generation JSON of at least 16 MiB selects HTTP SSE before submission, including behind a client-facing native WS. This heuristic avoids the WS whole-message boundary without claiming an exact provider limit or rejecting input. Keep the selected account, scoped identity, Lite mode, full input and durable accounting; never retry a submitted WS message over HTTP. HTTP continuations expand the bounded latest window or return a pre-submission `previous_response_not_found` for client-controlled full input. Native non-generating warmup stays on WS. HTTP status errors remain redacted; quota/auth/health are observed from the actual HTTP response, not reinterpreted from their downstream projection.
+
+Large completed continuation windows are compressed only in transient router memory, preserving the existing 16 MiB retained-window/64 MiB shared budgets while allowing up to 64 MiB decoded recovery. The upstream receives the exact original input and opaque values after normal proof validation. This cache compression is separate from HTTP/WS wire compression and never persists a body, submits extra inference or bypasses account eligibility. Recovery beyond its bounds still requires client-carried full input; full inference admission remains independent.
 
 ## Native identity and continuation
 

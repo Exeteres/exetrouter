@@ -5,6 +5,11 @@ use crate::{
     Result,
 };
 use chrono::Utc;
+use codex_websocket::{
+    connect_async_with_config,
+    tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig},
+    MaybeTlsStream, WebSocketStream,
+};
 use futures_util::StreamExt;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
@@ -12,18 +17,76 @@ use reqwest::{
 };
 use rusqlite::params;
 use serde_json::Value;
-use std::{collections::BTreeMap, net::IpAddr, ops::Deref, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::IpAddr,
+    ops::{Deref, DerefMut},
+    time::Duration,
+};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_tungstenite::{
-    connect_async_with_config,
-    tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig},
-    MaybeTlsStream, WebSocketStream,
-};
 
 pub const CODEX_CLIENT_VERSION: &str = "0.159.3";
 pub const BACKEND: &str = "https://chatgpt.com/backend-api/codex";
-pub type UpstreamSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub struct UpstreamSocket {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    pub(crate) compressed: bool,
+}
+
+impl Deref for UpstreamSocket {
+    type Target = WebSocketStream<MaybeTlsStream<TcpStream>>;
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
+}
+
+impl DerefMut for UpstreamSocket {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.socket
+    }
+}
+
+pub(crate) enum ResponsesConnection {
+    WebSocket(Box<UpstreamSocket>),
+    Http,
+}
+
+impl ResponsesConnection {
+    pub(crate) fn socket_mut(&mut self) -> Option<&mut UpstreamSocket> {
+        match self {
+            Self::WebSocket(socket) => Some(socket),
+            Self::Http => None,
+        }
+    }
+
+    pub(crate) fn is_http(&self) -> bool {
+        matches!(self, Self::Http)
+    }
+}
+
+/// A transport preference, never an input admission limit. Compression and
+/// fragmentation do not remove upstream whole-message limits. Count without
+/// allocating a second serialized request, stopping once HTTP is preferable.
+pub(crate) fn prefer_http(body: &Value) -> bool {
+    if body["generate"] == false {
+        // Non-generating warmup is a native WS operation, not an HTTP inference.
+        return false;
+    }
+    struct Size(usize);
+    impl std::io::Write for Size {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 >= 16 * 1024 * 1024 {
+                return Err(std::io::Error::other("prefer HTTP transport"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(&mut Size(0), body).is_err()
+}
 
 #[derive(Default)]
 pub struct InferenceHeaders<'a> {
@@ -812,7 +875,7 @@ impl Upstream {
     }
 
     /// Handshake quota refusals prove no response.create was submitted.
-    pub(crate) async fn websocket_with_quota_fallback(
+    pub(crate) async fn connect_with_quota_fallback(
         &self,
         mut account: Selection,
         user: i64,
@@ -820,11 +883,11 @@ impl Upstream {
         identity: (&str, &str),
         payload: &mut Value,
         responses_lite: bool,
-    ) -> std::result::Result<(Selection, UpstreamSocket, HeaderMap), SocketError> {
+    ) -> std::result::Result<(Selection, ResponsesConnection, HeaderMap), SocketError> {
         let mut excluded = Vec::new();
         loop {
             match self
-                .websocket(&account, identity, false, payload, responses_lite)
+                .connect(&account, identity, payload, responses_lite)
                 .await
             {
                 Ok((socket, headers)) => return Ok((account, socket, headers)),
@@ -847,6 +910,26 @@ impl Upstream {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    pub(crate) async fn connect(
+        &self,
+        account: &Account,
+        session: (&str, &str),
+        body: &Value,
+        responses_lite: bool,
+    ) -> std::result::Result<(ResponsesConnection, HeaderMap), SocketError> {
+        if prefer_http(body) {
+            match self.check_cooldown(account).await {
+                Ok(()) => return Ok((ResponsesConnection::Http, HeaderMap::new())),
+                Err(SelectError::Cooldown(until)) => return Err(SocketError::Cooldown(until)),
+                Err(SelectError::Backoff(until)) => return Err(SocketError::Backoff(until)),
+                Err(_) => return Err(SocketError::Storage),
+            }
+        }
+        self.websocket(account, session, false, body, responses_lite)
+            .await
+            .map(|(socket, headers)| (ResponsesConnection::WebSocket(Box::new(socket)), headers))
     }
 
     pub async fn websocket(
@@ -879,10 +962,13 @@ impl Upstream {
             Ok(request)
         })();
         let request = request.map_err(|_| SocketError::Unavailable)?;
-        let config = WebSocketConfig::default()
+        let mut config = WebSocketConfig::default()
             .max_message_size(Some(crate::payload::UPSTREAM_WS_MESSAGE_BYTES))
-            .max_frame_size(Some(crate::payload::UPSTREAM_WS_MESSAGE_BYTES))
-            .max_write_buffer_size(2 * crate::server::MAX_INFERENCE_REQUEST_BYTES);
+            .max_frame_size(Some(crate::payload::UPSTREAM_WS_MESSAGE_BYTES));
+        // Match the released Codex client's RFC 7692 negotiation. Incoming
+        // decompressed events retain the independent 1 MiB message bound.
+        config.extensions.permessage_deflate =
+            Some(codex_tungstenite::extensions::compression::deflate::DeflateConfig::default());
         let order = self
             .db
             .call(|conn| crate::health::next(conn))
@@ -912,7 +998,7 @@ impl Upstream {
         };
         let (socket, response) = match result {
             Ok(value) => value,
-            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            Err(codex_websocket::tungstenite::Error::Http(response))
                 if response.status().as_u16() == 429 =>
             {
                 let body = response
@@ -928,7 +1014,7 @@ impl Upstream {
                     Ok(()) => Err(SocketError::Cooldown(Utc::now().timestamp())),
                 };
             }
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Err(codex_websocket::tungstenite::Error::Http(response)) => {
                 if response.status().as_u16() == 401 {
                     self.unauthorized(account, crate::health::Scope::Responses, order)
                         .await
@@ -967,7 +1053,26 @@ impl Upstream {
         };
         self.observe_handshake(account, response.headers().clone(), 200, None)
             .await?;
-        Ok((socket, response.headers().clone()))
+        let compressed = response
+            .headers()
+            .get_all("sec-websocket-extensions")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|extension| {
+                extension
+                    .split(';')
+                    .next()
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("permessage-deflate"))
+            });
+        tracing::info!(
+            event = "upstream_websocket_transport",
+            permessage_deflate = compressed
+        );
+        Ok((
+            UpstreamSocket { socket, compressed },
+            response.headers().clone(),
+        ))
     }
 
     async fn observe_handshake(
@@ -1160,7 +1265,7 @@ impl SseDecoder {
 
 pub(crate) async fn next_ws(
     socket: &mut UpstreamSocket,
-) -> Result<Option<tokio_tungstenite::tungstenite::Message>> {
+) -> Result<Option<codex_websocket::tungstenite::Message>> {
     tokio::time::timeout(INFERENCE_IDLE_TIMEOUT, socket.next())
         .await
         .map_err(|_| "upstream stream timed out")?
@@ -1171,6 +1276,18 @@ pub(crate) async fn next_ws(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn http_preference_is_not_an_input_limit_or_a_generating_warmup() {
+        let mut body = serde_json::json!({"input":[{"role":"user","content":"small"}]});
+        assert!(!prefer_http(&body));
+        body["input"][0]["content"] = serde_json::json!("x".repeat(16 * 1024 * 1024));
+        assert!(prefer_http(&body));
+        body["generate"] = serde_json::json!(false);
+        assert!(!prefer_http(&body));
+        body["generate"] = serde_json::json!(true);
+        assert!(prefer_http(&body));
+    }
+
     #[test]
     fn sse_event_budget_is_independent_of_large_inference_input() {
         let limit = crate::payload::UPSTREAM_SSE_EVENT_BYTES;

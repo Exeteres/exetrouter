@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     affinity, chat,
     oauth::Account,
-    upstream::{SseDecoder, SseFrame, Upstream, UpstreamSocket},
+    upstream::{ResponsesConnection, SseDecoder, SseFrame, Upstream, UpstreamSocket},
     usage::{self, Counters, RequestOutcome, RequestRecord},
 };
 use axum::{
@@ -13,16 +13,18 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue},
 };
+use codex_websocket::tungstenite::Message as UpstreamMessage;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 
 const WS_PING_INTERVAL: Duration = Duration::from_secs(15);
 const WS_PRE_RESPONSE_SILENCE: Duration = Duration::from_secs(90);
 const WS_UPSTREAM_IDLE: Duration = Duration::from_secs(30);
 const WS_UPSTREAM_MAX_AGE: Duration = Duration::from_secs(300);
 const WS_CLIENT_IDLE: Duration = Duration::from_secs(300);
+const UPSTREAM_SIZE_CODE: &str = "upstream_request_too_large";
+const UPSTREAM_SIZE_MESSAGE: &str = "upstream rejected the WebSocket message size; message bytes and model context tokens are separate limits";
 
 fn ws_retirement_deadline(connected: Instant, idle_since: Instant) -> Instant {
     (connected + WS_UPSTREAM_MAX_AGE).min(idle_since + WS_UPSTREAM_IDLE)
@@ -105,7 +107,20 @@ impl WsInterruption {
         }
     }
 
+    fn request_too_large(&self) -> bool {
+        self.reason == "upstream_close" && self.close_code == Some(1009)
+    }
+
     fn client_error(&self, id: &RequestId) -> String {
+        if self.request_too_large() {
+            return ws_error(
+                UPSTREAM_SIZE_CODE,
+                &format!(
+                    "{UPSTREAM_SIZE_MESSAGE} (close_code=1009, request={})",
+                    id.0
+                ),
+            );
+        }
         let close = self
             .close_code
             .map(|code| format!(", close_code={code}"))
@@ -119,9 +134,9 @@ impl WsInterruption {
         )
     }
 
-    fn transport(reason: &'static str, error: &tokio_tungstenite::tungstenite::Error) -> Self {
+    fn transport(reason: &'static str, error: &codex_websocket::tungstenite::Error) -> Self {
+        use codex_websocket::tungstenite::{error::ProtocolError, Error};
         use std::io::ErrorKind;
-        use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
         let kind = match error {
             Error::ConnectionClosed => "connection_closed",
             Error::AlreadyClosed => "already_closed",
@@ -289,6 +304,7 @@ enum JsonReply {
     BackendError(StatusCode, Value),
     Quota(i64),
     Authentication,
+    MessageTooLarge,
 }
 
 fn backend_event_error(event: &Value) -> Option<(StatusCode, Value)> {
@@ -996,6 +1012,37 @@ fn response_metadata(headers: &HeaderMap) -> HeaderMap {
     result
 }
 
+fn ws_response_metadata(
+    headers: &HeaderMap,
+    log: &RequestLog,
+) -> std::result::Result<Option<String>, WsInterruption> {
+    let mut safe = response_metadata(headers);
+    if let Some(value) = headers.get("x-codex-turn-state") {
+        let turn = value
+            .to_str()
+            .map_err(|_| WsInterruption::new("invalid_turn_state").at("handshake_metadata"))?;
+        let turn = log
+            .remember_turn(turn)
+            .map_err(|_| WsInterruption::new("turn_binding_failed").at("handshake_metadata"))?;
+        safe.insert(
+            "x-codex-turn-state",
+            HeaderValue::from_str(&turn).map_err(|_| WsInterruption::new("invalid_turn_state"))?,
+        );
+    }
+    Ok((!safe.is_empty()).then(|| {
+        let headers = safe
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    json!(value.to_str().expect("validated metadata")),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        json!({"type":"response.metadata","headers":headers}).to_string()
+    }))
+}
+
 pub(super) async fn http(
     state: Arc<AppState>,
     identity: Identity,
@@ -1186,7 +1233,7 @@ pub(super) async fn http(
         Ok(value) => value,
         Err(_) => return ContextError::Missing.response(),
     };
-    let socket = if chat_request {
+    let socket = if chat_request && !crate::upstream::prefer_http(&dispatch_payload) {
         tokio::select! {
             _=wait_for_stop(stopped.clone())=> {
                 let _=log.finish("interrupted", Counters::default()).await;
@@ -1212,6 +1259,7 @@ pub(super) async fn http(
             },
         }
     } else {
+        log.transport = "http_sse";
         None
     };
     if let Err(err) = upstream.check_cooldown(&account).await {
@@ -1472,7 +1520,9 @@ pub(super) async fn http(
                         },
                         Err(err)=> {
                             log.interrupted(if err.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) {"read_timeout"} else {"transport_or_protocol"});
-                            let _=log.health(Some(crate::health::Rejection::Temporary),"transport").await;
+                            if !err.downcast_ref::<WsInterruption>().is_some_and(WsInterruption::request_too_large) {
+                                let _=log.health(Some(crate::health::Rejection::Temporary),"transport").await;
+                            }
                             return Err(err);
                         }
                     },
@@ -1565,12 +1615,19 @@ pub(super) async fn http(
             }
         }
         .await;
+        let too_large = result.as_ref().err().is_some_and(|error| {
+            error.downcast_ref::<WsInterruption>().is_some_and(WsInterruption::request_too_large)
+        });
         if result.is_err() {
             let _ = log.finish("interrupted", Counters::default()).await;
             if streaming {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(1),
-                    send.send(Bytes::from(if chat_request {
+                    send.send(Bytes::from(if too_large && chat_request {
+                        format!("data: {}\n\n", ws_error(UPSTREAM_SIZE_CODE, UPSTREAM_SIZE_MESSAGE)).into_bytes()
+                    } else if too_large {
+                        sse_error(UPSTREAM_SIZE_CODE, UPSTREAM_SIZE_MESSAGE).into_bytes()
+                    } else if chat_request {
                         chat::stream_error()
                     } else {
                         sse_error(
@@ -1583,7 +1640,9 @@ pub(super) async fn http(
                 .await;
             }
         }
-        let _ = json_send.send(if result.is_ok() {
+        let _ = json_send.send(if too_large {
+            Ok(JsonReply::MessageTooLarge)
+        } else if result.is_ok() {
             terminal.ok_or("upstream returned no response".into())
         } else {
             Err("upstream interrupted".into())
@@ -1617,6 +1676,11 @@ pub(super) async fn http(
                 StatusCode::BAD_GATEWAY,
                 "upstream_authentication_error",
                 "upstream credentials rejected; a separate new request may refresh them",
+            ),
+            Ok(Ok(JsonReply::MessageTooLarge)) => error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                UPSTREAM_SIZE_CODE,
+                UPSTREAM_SIZE_MESSAGE,
             ),
             _ => error(
                 StatusCode::BAD_GATEWAY,
@@ -1660,9 +1724,229 @@ impl Source {
                     Ok(Some(Vec::new()))
                 }
                 Some(UpstreamMessage::Pong(_)) => Ok(Some(Vec::new())),
+                Some(UpstreamMessage::Close(Some(frame))) if u16::from(frame.code) == 1009 => {
+                    Err(WsInterruption {
+                        close_code: Some(1009),
+                        ..WsInterruption::new("upstream_close")
+                    }
+                    .into())
+                }
                 Some(UpstreamMessage::Close(_)) | None => Ok(None),
                 _ => Err("unsupported upstream frame".into()),
             },
+        }
+    }
+}
+
+// The downstream protocol remains native WS. Only the selected account's
+// upstream transport changes; no worker or replay queue. Recovery uses the
+// separately bounded, transient continuation window.
+enum WsSource<'a> {
+    WebSocket(&'a mut UpstreamSocket),
+    Http {
+        response: reqwest::Response,
+        decoder: SseDecoder,
+        pending: VecDeque<SseFrame>,
+    },
+    Rejected(Option<Value>),
+}
+
+enum WsIncoming {
+    Message(UpstreamMessage),
+    HttpActivity,
+}
+
+impl<'a> WsSource<'a> {
+    async fn http(
+        response: reqwest::Response,
+        log: &mut RequestLog,
+    ) -> std::result::Result<(Self, HeaderMap), WsInterruption> {
+        log.request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| v.len() <= 256)
+            .map(str::to_owned);
+        let now = chrono::Utc::now().timestamp();
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let headers = response.headers().clone();
+            let body = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::oauth::read_json(response, 65_536),
+            )
+            .await
+            .ok()
+            .and_then(std::result::Result::ok);
+            let observation = crate::quota::http(&headers, status, body.as_ref(), now);
+            let until = observation.cooldown_until();
+            log.rejection_until = until;
+            log.authentication_rejected = status == 401;
+            let saved = log.quota(observation, now).await.is_ok();
+            let accounted = log
+                .finish("upstream_rejected", Counters::default())
+                .await
+                .is_ok();
+            let mut refusal = body.unwrap_or(Value::Null);
+            if let Some(body) = refusal.as_object_mut() {
+                body.insert("type".into(), json!("error"));
+            }
+            let code = if status == 429 && saved && accounted && quota_refusal(&refusal) {
+                "usage_limit_reached"
+            } else {
+                "upstream_rejected"
+            };
+            // Never echo an HTTP error body. Keep only status, a fixed code and
+            // validated numeric retry information for native error handling.
+            let mut event = json!({"type":"error","status":status,"error":{"code":code,"type":code,"message":"upstream rejected the request"}});
+            if let Some(until) = until {
+                event["headers"] =
+                    json!({"retry-after":until.saturating_sub(now).max(0).to_string()});
+            }
+            return Ok((Self::Rejected(Some(event)), HeaderMap::new()));
+        }
+        let _ = log
+            .quota(crate::quota::headers(response.headers(), 200, now), now)
+            .await;
+        if response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| {
+                !s.split(';')
+                    .next()
+                    .unwrap_or(s)
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            })
+        {
+            let _ = log
+                .health(Some(crate::health::Rejection::Temporary), "protocol")
+                .await;
+            return Err(WsInterruption::new("upstream_invalid_content_type"));
+        }
+        let headers = response.headers().clone();
+        Ok((
+            Self::Http {
+                response,
+                decoder: SseDecoder::default(),
+                pending: VecDeque::new(),
+            },
+            headers,
+        ))
+    }
+
+    async fn next(&mut self) -> std::result::Result<Option<WsIncoming>, WsInterruption> {
+        match self {
+            Self::WebSocket(socket) => socket
+                .next()
+                .await
+                .transpose()
+                .map(|message| message.map(WsIncoming::Message))
+                .map_err(|error| WsInterruption::transport("upstream_read_error", &error)),
+            Self::Rejected(event) => Ok(event
+                .take()
+                .map(|event| WsIncoming::Message(UpstreamMessage::Text(event.to_string().into())))),
+            Self::Http {
+                response,
+                decoder,
+                pending,
+            } => {
+                if let Some(frame) = pending.pop_front() {
+                    return Ok(Some(match frame.event {
+                        Some(event) => {
+                            WsIncoming::Message(UpstreamMessage::Text(event.to_string().into()))
+                        }
+                        None => WsIncoming::HttpActivity,
+                    }));
+                }
+                let chunk = response.chunk().await.map_err(|error| {
+                    WsInterruption::new(if error.is_timeout() {
+                        "read_timeout"
+                    } else {
+                        "upstream_read_error"
+                    })
+                })?;
+                let Some(chunk) = chunk else {
+                    if !decoder.is_empty() {
+                        return Err(WsInterruption::new("upstream_incomplete_sse_event"));
+                    }
+                    return Ok(None);
+                };
+                pending.extend(
+                    decoder
+                        .push(&chunk)
+                        .map_err(|_| WsInterruption::new("upstream_invalid_sse_event"))?,
+                );
+                Ok(Some(WsIncoming::HttpActivity))
+            }
+        }
+    }
+
+    async fn control(
+        &mut self,
+        message: UpstreamMessage,
+    ) -> std::result::Result<(), WsInterruption> {
+        if let Self::WebSocket(socket) = self {
+            send_upstream(socket, message).await?;
+        }
+        Ok(())
+    }
+
+    fn deadline(&self, liveness: &WsLiveness) -> Instant {
+        if matches!(self, Self::WebSocket(_)) {
+            liveness.deadline()
+        } else {
+            liveness.last_frame + crate::upstream::INFERENCE_IDLE_TIMEOUT
+        }
+    }
+}
+
+async fn ws_client_control(
+    client: &mut WebSocket,
+    incoming: Option<std::result::Result<Message, axum::Error>>,
+) -> std::result::Result<(), WsInterruption> {
+    match incoming {
+        Some(Ok(Message::Ping(bytes))) => send_client_message(client, Message::Pong(bytes))
+            .await
+            .map_err(|failure| failure.at("client_pong_write")),
+        Some(Ok(Message::Pong(_))) => Ok(()),
+        Some(Ok(Message::Close(frame))) => Err(WsInterruption {
+            close_code: frame.map(|frame| frame.code),
+            ..WsInterruption::new("client_close")
+        }),
+        None => Err(WsInterruption::new("client_eof")),
+        Some(Err(_)) => Err(WsInterruption::new("client_read_error")),
+        Some(Ok(Message::Text(_))) => Err(WsInterruption::new("client_concurrent_request")),
+        Some(Ok(Message::Binary(_))) => Err(WsInterruption::new("client_invalid_frame")),
+    }
+}
+
+// HTTP headers may arrive only after generation begins. Continue servicing the
+// client and shutdown while awaiting them, and cancel the in-flight future on
+// disconnect. Durable sent/unknown accounting was established before this call.
+async fn ws_await_submission<T>(
+    client: &mut WebSocket,
+    client_seen: &mut Instant,
+    stopped: watch::Receiver<bool>,
+    operation: impl std::future::Future<Output = std::result::Result<T, WsInterruption>>,
+) -> std::result::Result<T, WsInterruption> {
+    tokio::pin!(operation);
+    let mut heartbeat = tokio::time::interval(WS_PING_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = wait_for_stop(stopped.clone()) => return Err(WsInterruption::new("service_stopping")),
+            _ = heartbeat.tick() => {
+                send_client_message(client, Message::Ping(Bytes::new())).await?;
+                send_client(client, json!({"type":"ping"}).to_string()).await?;
+            },
+            incoming = client.next() => {
+                *client_seen = Instant::now();
+                ws_client_control(client, incoming).await?;
+            }
         }
     }
 }
@@ -1771,8 +2055,10 @@ pub(super) async fn websocket(
     }
     let jobs = state.jobs.clone();
     let upgrade_id = id.clone();
-    ws.max_message_size(MAX_INFERENCE_REQUEST_BYTES)
-        .max_frame_size(MAX_INFERENCE_REQUEST_BYTES)
+    // Axum exposes usize rather than Option<usize>; usize::MAX disables its
+    // default message/frame ceilings without imposing a router context limit.
+    ws.max_message_size(usize::MAX)
+        .max_frame_size(usize::MAX)
         .on_failed_upgrade(move |_| {
             tracing::info!(event="client_websocket_upgrade_failed",client_connection_id=%upgrade_id.0);
         })
@@ -1811,10 +2097,49 @@ async fn send_upstream(
     socket: &mut UpstreamSocket,
     message: UpstreamMessage,
 ) -> std::result::Result<(), WsInterruption> {
-    tokio::time::timeout(Duration::from_secs(10), socket.send(message))
-        .await
-        .map_err(|_| WsInterruption::new("upstream_write_timeout"))?
-        .map_err(|error| WsInterruption::transport("upstream_write_error", &error))
+    tokio::time::timeout(Duration::from_secs(10), async {
+        if socket.compressed {
+            // Raw continuation frames bypass Tungstenite's negotiated message
+            // compressor. Send the whole message through its RFC 7692 encoder.
+            // This changes wire encoding only, never input content or context.
+            return socket.send(message).await;
+        }
+        if let UpstreamMessage::Text(text) = message {
+            use codex_websocket::tungstenite::protocol::{
+                frame::coding::{Data, OpCode},
+                frame::Frame,
+            };
+            // Fragment one text message, not the request/context. Receivers
+            // reassemble identical UTF-8 bytes even across character boundaries.
+            // Flushing each fragment also bounds the socket's write buffer.
+            let bytes = Bytes::from(text);
+            let chunk = crate::payload::UPSTREAM_WS_FRAME_BYTES;
+            for start in (0..bytes.len()).step_by(chunk) {
+                let end = start.saturating_add(chunk).min(bytes.len());
+                let opcode = OpCode::Data(if start == 0 {
+                    Data::Text
+                } else {
+                    Data::Continue
+                });
+                socket
+                    .send(UpstreamMessage::Frame(Frame::message(
+                        bytes.slice(start..end),
+                        opcode,
+                        end == bytes.len(),
+                    )))
+                    .await?;
+            }
+            if bytes.is_empty() {
+                socket.send(UpstreamMessage::Text("".into())).await?;
+            }
+            Ok(())
+        } else {
+            socket.send(message).await
+        }
+    })
+    .await
+    .map_err(|_| WsInterruption::new("upstream_write_timeout"))?
+    .map_err(|error| WsInterruption::transport("upstream_write_error", &error))
 }
 
 struct WsSession {
@@ -1844,7 +2169,7 @@ impl Drop for ClientWsLog {
 
 struct WsBinding {
     account: crate::upstream::Selection,
-    socket: Option<UpstreamSocket>,
+    connection: Option<ResponsesConnection>,
     metadata: Option<HeaderMap>,
     // At most one bounded idle metadata notification, delivered after created.
     pending_metadata: Option<String>,
@@ -1858,12 +2183,12 @@ struct WsBinding {
 impl WsBinding {
     fn new(
         account: crate::upstream::Selection,
-        socket: UpstreamSocket,
+        connection: ResponsesConnection,
         metadata: HeaderMap,
     ) -> Self {
         Self {
             account,
-            socket: Some(socket),
+            connection: Some(connection),
             metadata: Some(metadata),
             pending_metadata: None,
             connection_id: RequestId::new(),
@@ -1875,7 +2200,7 @@ impl WsBinding {
     }
 
     async fn close(&mut self) {
-        if let Some(mut socket) = self.socket.take() {
+        if let Some(ResponsesConnection::WebSocket(mut socket)) = self.connection.take() {
             let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
         }
         self.metadata = None;
@@ -1924,7 +2249,10 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
         let message = loop {
             let retirement = binding
                 .as_ref()
-                .filter(|bound| bound.socket.is_some() && window.is_some())
+                .filter(|bound| {
+                    matches!(bound.connection, Some(ResponsesConnection::WebSocket(_)))
+                        && window.is_some()
+                })
                 .map(|bound| ws_retirement_deadline(bound.connected, bound.idle_since));
             tokio::select! {
                 // Consume queued upstream closure before a simultaneously ready new request.
@@ -1961,7 +2289,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     }
                 },
                 incoming = async {
-                    match binding.as_mut().and_then(|bound| bound.socket.as_mut()) {
+                    match binding.as_mut().and_then(|bound| bound.connection.as_mut()).and_then(ResponsesConnection::socket_mut) {
                         Some(socket) => socket.next().await,
                         None => std::future::pending().await,
                     }
@@ -1969,7 +2297,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     let bound = binding.as_mut().expect("polled binding");
                     let failure = match incoming {
                         Some(Ok(UpstreamMessage::Ping(bytes))) => {
-                            send_upstream(bound.socket.as_mut().expect("polled socket"), UpstreamMessage::Pong(bytes))
+                            send_upstream(bound.connection.as_mut().and_then(ResponsesConnection::socket_mut).expect("polled socket"), UpstreamMessage::Pong(bytes))
                                 .await.err()
                         }
                         Some(Ok(UpstreamMessage::Pong(_))) => None,
@@ -2377,7 +2705,16 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                     if !required {
                                         break 'migration;
                                     }
-                                    let _ = send_client(&mut client, ws_error("context_recovery_unavailable", "account unavailable; reconnect with the full current context to switch accounts")).await;
+                                    let code = if bound
+                                        .connection
+                                        .as_ref()
+                                        .is_some_and(ResponsesConnection::is_http)
+                                    {
+                                        "previous_response_not_found"
+                                    } else {
+                                        "context_recovery_unavailable"
+                                    };
+                                    let _ = send_client(&mut client, ws_error(code, "account unavailable; full current context required before switching accounts")).await;
                                     continue 'frames;
                                 }
                                 // Keep only bounded routing metadata to restore a soft
@@ -2391,7 +2728,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                 let thread = upstream_thread.as_deref().expect("bound thread");
                                 let replacement = if required {
                                     upstream
-                                        .websocket_with_quota_fallback(
+                                        .connect_with_quota_fallback(
                                             account,
                                             identity.user_id,
                                             &model,
@@ -2409,10 +2746,9 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                     // A proactive preference may fall back to the existing
                                     // healthy connection if its alternative refuses the handshake.
                                     upstream
-                                        .websocket(
+                                        .connect(
                                             &account,
                                             (native_session, thread),
-                                            false,
                                             &affinity::upstream_payload(
                                                 &payload,
                                                 &state.key,
@@ -2563,7 +2899,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                 }
 
                 let (account, socket, metadata) = match upstream
-                    .websocket_with_quota_fallback(
+                    .connect_with_quota_fallback(
                         account,
                         identity.user_id,
                         &model,
@@ -2669,7 +3005,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
             }
             let WsBinding {
                 account,
-                socket,
+                connection,
                 metadata,
                 pending_metadata,
                 connection_id,
@@ -2729,11 +3065,17 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     break 'frames;
                 }
             }
-            // Old socket IDs require recovery even after a replacement socket is open.
+            // HTTP cannot use a WS response ID, even on the same account. Ask
+            // the client for full input before submission if bounded recovery
+            // cannot expand it. Native clients implement this explicit refusal.
+            let http = connection
+                .as_ref()
+                .is_some_and(ResponsesConnection::is_http)
+                || crate::upstream::prefer_http(&payload);
             if payload
                 .get("previous_response_id")
                 .and_then(Value::as_str)
-                .is_some_and(|id| socket.is_none() || !upstream_responses.contains(id))
+                .is_some_and(|id| http || connection.is_none() || !upstream_responses.contains(id))
                 && !window
                     .as_ref()
                     .is_some_and(|history| history.expand(&mut payload))
@@ -2741,14 +3083,45 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                 let _ = send_client(
                     &mut client,
                     ws_error(
-                        "context_recovery_unavailable",
-                        "upstream connection closed; reconnect with the full current context",
+                        if http {
+                            "previous_response_not_found"
+                        } else {
+                            "context_recovery_unavailable"
+                        },
+                        "full current context required before upstream submission",
                     ),
                 )
                 .await;
                 continue 'frames;
             }
-            if socket.is_none() {
+            if http && payload["generate"] != false {
+                if !connection
+                    .as_ref()
+                    .is_some_and(ResponsesConnection::is_http)
+                {
+                    if let Some(ResponsesConnection::WebSocket(mut socket)) = connection.take() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
+                    }
+                    if let Some(meta) = payload
+                        .get_mut("client_metadata")
+                        .and_then(Value::as_object_mut)
+                    {
+                        meta.remove("x-codex-turn-state");
+                    }
+                    *metadata = None;
+                    *pending_metadata = None;
+                    upstream_responses.clear();
+                    *connection = Some(ResponsesConnection::Http);
+                }
+            } else if connection
+                .as_ref()
+                .is_some_and(ResponsesConnection::is_http)
+            {
+                // Do not turn generate=false warmup into a billed HTTP request.
+                *connection = None;
+            }
+            if connection.is_none() {
                 // This is a new, unsent operation after a completed response, not a retry.
                 if let Some(meta) = payload
                     .get_mut("client_metadata")
@@ -2757,13 +3130,12 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     meta.remove("x-codex-turn-state");
                 }
                 match upstream
-                    .websocket(
+                    .connect(
                         account,
                         (
                             upstream_identity_session.as_deref().expect("bound session"),
                             upstream_thread.as_deref().expect("bound thread"),
                         ),
-                        false,
                         &affinity::upstream_payload(&payload, &state.key, identity.user_id)
                             .expect("validated context"),
                         responses_lite,
@@ -2771,7 +3143,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     .await
                 {
                     Ok((replacement, headers)) => {
-                        *socket = Some(replacement);
+                        *connection = Some(replacement);
                         *metadata = Some(headers);
                         *pending_metadata = None;
                         *connection_id = RequestId::new();
@@ -2807,12 +3179,13 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                     }
                 }
             }
-            let socket = socket.as_mut().expect("connected socket");
+            let connection = connection.as_mut().expect("connected transport");
+            let http = connection.is_http();
             let id = RequestId::new();
             let mut log = match RequestLog::begin(
                 &state,
                 record(&identity, &id, account, &model, "responses", "websocket"),
-                "websocket",
+                if http { "http_sse" } else { "websocket" },
                 account,
                 routing_outputs(&payload, &pending_routing),
             )
@@ -2834,47 +3207,73 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
             let mut recovery_output = Some(super::output::CompletionOutput::default());
             let mut liveness = WsLiveness::new(Instant::now());
             let result: std::result::Result<(), WsInterruption> = async {
-                let mut handshake_metadata = None;
-                if let Some(headers) = metadata.take() {
-                    let mut safe = response_metadata(&headers);
-                    if let Some(value) = headers.get("x-codex-turn-state") {
-                        let turn = value.to_str().map_err(|_| {
-                            WsInterruption::new("invalid_turn_state").at("handshake_metadata")
-                        })?;
-                        let turn = log.remember_turn(turn).map_err(|_| {
-                            WsInterruption::new("turn_binding_failed").at("handshake_metadata")
-                        })?;
-                        safe.insert("x-codex-turn-state", HeaderValue::from_str(&turn).map_err(|_| WsInterruption::new("invalid_turn_state"))?);
-                    }
-                    if !safe.is_empty() {
-                        let headers = safe.iter().map(|(name, value)| {
-                            (name.as_str().to_owned(), json!(value.to_str().expect("validated metadata")))
-                        }).collect::<serde_json::Map<_, _>>();
-                        handshake_metadata = Some(json!({"type":"response.metadata","headers":headers}).to_string());
-                    }
-                }
+                let mut handshake_metadata = metadata.take().map(|headers| ws_response_metadata(&headers, &log)).transpose()?.flatten();
                 log.sent().await.map_err(|_| WsInterruption::new("request_storage_failed").at("before_submission"))?;
                 tracing::info!(event="upstream_websocket_request_started",request_id=%log.id,
                     connection_id=%connection_id.0,connection_age_ms=connected.elapsed().as_millis() as u64,
                     finished_requests=*finished,client_connection_id=%client_log.id.0,
+                    upstream_transport=log.transport,
                     frame_sequence=client_log.frames,preparation_ms=frame_received.elapsed().as_millis() as u64);
                 let write_started = Instant::now();
-                if let Err(failure) = send_upstream(socket, UpstreamMessage::Text(affinity::upstream_payload(&payload, &state.key, identity.user_id).map_err(|_| WsInterruption::new("context_proof_invalid"))?.to_string().into())).await {
-                    let _ = log.health(Some(crate::health::Rejection::Temporary), "transport").await;
-                    return Err(failure.at("request_write"));
+                let mut dispatch = affinity::upstream_payload(&payload, &state.key, identity.user_id)
+                    .map_err(|_| WsInterruption::new("context_proof_invalid"))?;
+                let mut source = match connection {
+                    ResponsesConnection::WebSocket(socket) => {
+                        if let Err(failure) = send_upstream(socket, UpstreamMessage::Text(dispatch.to_string().into())).await {
+                            let _ = log.health(Some(crate::health::Rejection::Temporary), "transport").await;
+                            return Err(failure.at("request_write"));
+                        }
+                        WsSource::WebSocket(socket)
+                    },
+                    ResponsesConnection::Http => {
+                        let body = dispatch.as_object_mut().expect("validated request");
+                        body.remove("type");
+                        if body.get("generate") == Some(&Value::Bool(true)) { body.remove("generate"); }
+                        body.insert("stream".into(), json!(true));
+                        let turn = dispatch.pointer("/client_metadata/x-codex-turn-state")
+                            .and_then(Value::as_str).map(HeaderValue::from_str).transpose()
+                            .map_err(|_| WsInterruption::new("invalid_turn_state"))?;
+                        let (source, headers) = ws_await_submission(&mut client, &mut client_seen, stopped.clone(), async {
+                            let response = upstream.post(account, "responses", &dispatch,
+                                Some((upstream_identity_session.as_deref().expect("bound session"), upstream_thread.as_deref().expect("bound thread"))),
+                                log.health_order, crate::upstream::InferenceHeaders { turn_state:turn.as_ref(), responses_lite })
+                                .await.map_err(|_| WsInterruption::new("upstream_connection_failed").at("request_write"))?;
+                            WsSource::http(response, &mut log).await
+                        }).await?;
+                        // As on HTTP, an unbindable header is omitted while the
+                        // accepted inference is still drained and accounted for.
+                        handshake_metadata = ws_response_metadata(&headers, &log).ok().flatten();
+                        source
+                    },
+                };
+                drop(dispatch);
+                if let WsSource::Rejected(event) = &mut source {
+                    let event = event.take().expect("one HTTP refusal");
+                    // HTTP status/quota/auth observations were already saved
+                    // from the actual headers/body. Do not reinterpret this
+                    // redacted projection as a second upstream observation.
+                    if payload["conversation"].is_null() && quota_refusal(&event) {
+                        rejected_quota = Some(event.to_string());
+                    } else {
+                        send_client(&mut client, if log.authentication_rejected {
+                            ws_error("upstream_authentication_error", "upstream credentials rejected; reconnect with full context using a separate new request")
+                        } else { event.to_string() }).await.map_err(|failure| failure.at("event_write"))?;
+                    }
+                    return Ok(());
                 }
                 tracing::info!(event="upstream_websocket_request_sent",request_id=%log.id,
-                    connection_id=%connection_id.0,duration_ms=write_started.elapsed().as_millis() as u64);
+                    connection_id=%connection_id.0,upstream_transport=log.transport,duration_ms=write_started.elapsed().as_millis() as u64);
                 liveness.last_frame = Instant::now();
                 let mut heartbeat = tokio::time::interval(WS_PING_INTERVAL);
                 heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 heartbeat.tick().await;
                 loop {
+                    let deadline = source.deadline(&liveness);
                     let message = tokio::select! {
                         _ = heartbeat.tick() => {
-                            send_upstream(socket, UpstreamMessage::Ping(Bytes::new())).await
+                            source.control(UpstreamMessage::Ping(Bytes::new())).await
                                 .map_err(|failure| failure.at("upstream_ping_write"))?;
-                            liveness.pings = liveness.pings.saturating_add(1);
+                            if !http { liveness.pings = liveness.pings.saturating_add(1); }
                             send_client_message(&mut client, Message::Ping(Bytes::new())).await
                                 .map_err(|failure| failure.at("client_ping_write"))?;
                             send_client(&mut client, json!({"type":"ping"}).to_string()).await
@@ -2882,8 +3281,12 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                             continue;
                         },
                         _ = wait_for_stop(stopped.clone()) => return Err(WsInterruption::new("service_stopping")),
-                        message = tokio::time::timeout_at(liveness.deadline().into(), socket.next()) => match message {
-                            Ok(Some(Ok(message))) => {
+                        message = tokio::time::timeout_at(deadline.into(), source.next()) => match message {
+                            Ok(Ok(Some(WsIncoming::HttpActivity))) => {
+                                liveness.received(Instant::now(), false);
+                                continue;
+                            },
+                            Ok(Ok(Some(WsIncoming::Message(message)))) => {
                                 if matches!(message, UpstreamMessage::Pong(_)) && liveness.pongs == 0 {
                                     tracing::info!(event="upstream_websocket_peer_alive",request_id=%log.id,
                                         connection_id=%connection_id.0,pings=liveness.pings,
@@ -2902,11 +3305,11 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                         tracing::info!(event="upstream_websocket_silence_timeout",request_id=%log.id,
                                             response_started=liveness.response_started,pings=liveness.pings,pongs=liveness.pongs,
                                             last_frame_age_ms=liveness.last_frame.elapsed().as_millis() as u64);
-                                        WsInterruption::new(if liveness.response_started { "read_timeout" } else { "pre_response_silence_timeout" })
+                                        WsInterruption::new(if http || liveness.response_started { "read_timeout" } else { "pre_response_silence_timeout" })
                                     },
-                                    Ok(None) => WsInterruption::new("upstream_eof"),
-                                    Ok(Some(Err(error))) => WsInterruption::transport("upstream_read_error", &error),
-                                    Ok(Some(Ok(_))) => unreachable!(),
+                                    Ok(Ok(None)) => WsInterruption::new("upstream_eof"),
+                                    Ok(Err(failure)) => failure,
+                                    Ok(Ok(Some(_))) => unreachable!(),
                                 };
                                 let _ = log.health(Some(crate::health::Rejection::Temporary), "transport").await;
                                 return Err(failure);
@@ -2914,30 +3317,14 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                         },
                         incoming = client.next() => {
                             client_seen = Instant::now();
-                            match incoming {
-                            Some(Ok(Message::Ping(bytes))) => {
-                                send_client_message(&mut client, Message::Pong(bytes)).await
-                                    .map_err(|failure| failure.at("client_pong_write"))?;
-                                continue;
-                            },
-                            Some(Ok(Message::Pong(_))) => continue,
-                            Some(Ok(Message::Close(frame))) => {
-                                return Err(WsInterruption {
-                                    close_code: frame.map(|frame| frame.code),
-                                    ..WsInterruption::new("client_close")
-                                });
-                            },
-                            None => return Err(WsInterruption::new("client_eof")),
-                            Some(Err(_)) => return Err(WsInterruption::new("client_read_error")),
-                            Some(Ok(Message::Text(_))) => return Err(WsInterruption::new("client_concurrent_request")),
-                            Some(Ok(Message::Binary(_))) => return Err(WsInterruption::new("client_invalid_frame")),
-                            }
+                            ws_client_control(&mut client, incoming).await?;
+                            continue;
                         },
                     };
                     let text = match message {
                         UpstreamMessage::Text(text) => text,
                         UpstreamMessage::Ping(bytes) => {
-                            send_upstream(socket, UpstreamMessage::Pong(bytes)).await
+                            source.control(UpstreamMessage::Pong(bytes)).await
                                 .map_err(|failure| failure.at("upstream_pong_write"))?;
                             continue;
                         },
@@ -2950,7 +3337,11 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                 },
                                 _ => WsInterruption::new("upstream_invalid_frame"),
                             };
-                            let _ = log.health(Some(crate::health::Rejection::Temporary), "transport").await;
+                            // A provider message-size rejection is request-specific,
+                            // not evidence that the whole account is unavailable.
+                            if !failure.request_too_large() {
+                                let _ = log.health(Some(crate::health::Rejection::Temporary), "transport").await;
+                            }
                             return Err(failure);
                         },
                     };
@@ -3064,7 +3455,7 @@ async fn ws_loop(mut client: WebSocket, session: WsSession) {
                                 meta.remove("x-codex-turn-state");
                             }
                             if let Ok((alternate, socket, metadata)) = upstream
-                                .websocket_with_quota_fallback(
+                                .connect_with_quota_fallback(
                                     alternate,
                                     identity.user_id,
                                     &model,
@@ -3165,6 +3556,141 @@ async fn next_sse_chunk(receive: &mut mpsc::Receiver<Bytes>, interval: Duration)
 mod heartbeat_tests {
     use super::*;
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Tungstenite fixes the handshake callback's error type."
+    )]
+    async fn compression_pair(
+        negotiate: bool,
+    ) -> (
+        UpstreamSocket,
+        codex_websocket::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        use codex_tungstenite::{
+            extensions::compression::deflate::DeflateConfig,
+            handshake::server::{Request, Response},
+            protocol::WebSocketConfig,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("state.sqlite"))
+            .await
+            .unwrap();
+        let id = db
+            .call(|conn| {
+                crate::oauth::save(
+                    conn,
+                    &crate::oauth::Vault::new([2; 32]),
+                    "synthetic-account",
+                    &crate::oauth::Credentials {
+                        access_token: "synthetic-access".into(),
+                        refresh_token: "synthetic-refresh".into(),
+                    },
+                    chrono::Utc::now().timestamp() + 3600,
+                )
+            })
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = Upstream::new(
+            db,
+            [2; 32],
+            crate::upstream::Config::new(base.clone(), base, true).unwrap(),
+        )
+        .unwrap();
+        let account = upstream.account(id).await.unwrap();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            // A compressed >16 MiB request must fit below this frame bound.
+            // Declining the extension instead tests ordinary 1 MiB fragments.
+            let mut config = WebSocketConfig::default()
+                .max_message_size(None)
+                .max_frame_size(Some(if negotiate { 256 * 1024 } else { 1024 * 1024 }));
+            config.extensions.permessage_deflate = negotiate.then(DeflateConfig::default);
+            codex_websocket::accept_hdr_async_with_config(
+                stream,
+                |request: &Request, response: Response| {
+                    assert!(request.headers()["sec-websocket-extensions"]
+                        .to_str()
+                        .unwrap()
+                        .contains("permessage-deflate"));
+                    Ok(response)
+                },
+                Some(config),
+            )
+            .await
+            .unwrap()
+        };
+        let body = json!({"model":"synthetic-model"});
+        let (server, client) = tokio::join!(
+            server,
+            upstream.websocket(
+                &account,
+                ("synthetic-session", "synthetic-thread"),
+                false,
+                &body,
+                false
+            )
+        );
+        let (client, headers) = client.ok().expect("synthetic compression handshake");
+        assert_eq!(client.compressed, negotiate);
+        assert_eq!(headers.contains_key("sec-websocket-extensions"), negotiate);
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn upstream_compression_preserves_large_utf8_messages_and_context_takeover() {
+        for negotiated in [true, false] {
+            let (mut client, mut server) = compression_pair(negotiated).await;
+            for text in [
+                "synthetic-compressed-history 🌍 ".repeat(600_000),
+                "next turn 🌍".into(),
+            ] {
+                let expected = text.clone();
+                let (sent, received) = tokio::join!(
+                    send_upstream(&mut client, UpstreamMessage::Text(text.into())),
+                    server.next(),
+                );
+                sent.unwrap();
+                assert_eq!(received.unwrap().unwrap().into_text().unwrap(), expected);
+                let reply = "synthetic response 🌍";
+                let (sent, received) = tokio::join!(
+                    server.send(UpstreamMessage::Text(reply.into())),
+                    crate::upstream::next_ws(&mut client),
+                );
+                sent.unwrap();
+                assert_eq!(received.unwrap().unwrap().into_text().unwrap(), reply);
+            }
+            let (sent, received) = tokio::join!(
+                send_upstream(
+                    &mut client,
+                    UpstreamMessage::Ping(Bytes::from_static(b"synthetic"))
+                ),
+                server.next(),
+            );
+            sent.unwrap();
+            assert!(matches!(
+                received.unwrap().unwrap(),
+                UpstreamMessage::Ping(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_upstream_events_still_enforce_the_decoded_output_bound() {
+        let (mut client, mut server) = compression_pair(true).await;
+        let text = "x".repeat(crate::payload::UPSTREAM_WS_MESSAGE_BYTES + 1);
+        let (sent, received) = tokio::join!(
+            server.send(UpstreamMessage::Text(text.into())),
+            client.next(),
+        );
+        sent.unwrap();
+        assert!(matches!(
+            received,
+            Some(Err(codex_tungstenite::Error::Capacity(_)))
+        ));
+    }
+
     #[test]
     fn websocket_liveness_distinguishes_silence_from_live_slow_generation() {
         let start = Instant::now();
@@ -3199,7 +3725,7 @@ mod heartbeat_tests {
 
     #[test]
     fn websocket_transport_diagnostics_discard_error_payloads() {
-        use tokio_tungstenite::tungstenite::{error::ProtocolError, Error};
+        use codex_websocket::tungstenite::{error::ProtocolError, Error};
         let private = "synthetic-private-error-content";
         for (error, expected) in [
             (

@@ -1,8 +1,8 @@
-//! Independent payload bounds for inference input, upstream events and projection.
-//! Larger image/history inputs must not implicitly enlarge output buffering.
-//! These bound wire/transient payloads, not process RSS or model context tokens.
+//! Output and transport buffering bounds, independent of model context windows.
+//! Inference input has no router-defined byte ceiling. Larger inputs must not
+//! implicitly enlarge upstream event or output projection buffers.
 
-pub(crate) const INFERENCE_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const UPSTREAM_WS_FRAME_BYTES: usize = 1024 * 1024;
 pub(crate) const UPSTREAM_WS_MESSAGE_BYTES: usize = 1024 * 1024;
 pub(crate) const UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 pub(crate) const PROJECTED_OUTPUT_BYTES: usize = 1024 * 1024;

@@ -530,10 +530,10 @@ fn json_rejection_diagnostics_are_fixed_and_never_echo_payloads() {
 }
 
 #[test]
-fn authenticated_http_accepts_bodies_through_128_mib_without_inference() {
+fn authenticated_http_accepts_bodies_beyond_the_former_ceiling_without_inference() {
     let server = Server::start();
     let token = server.token();
-    for size in [17 * 1024 * 1024, 128 * 1024 * 1024] {
+    for size in [17 * 1024 * 1024, 128 * 1024 * 1024 + 1] {
         // A valid JSON object without a model proves extraction passed, but
         // cannot submit inference or record usage, even with active accounts.
         let body = format!("{}{{}}", " ".repeat(size - 2));
@@ -548,7 +548,7 @@ fn authenticated_http_accepts_bodies_through_128_mib_without_inference() {
 }
 
 #[test]
-fn oversized_http_body_has_json_error_and_no_usage() {
+fn large_invalid_http_body_has_redacted_json_error_and_no_usage() {
     let server = Server::start();
     let token = server.token();
     let (status, reply) = server.http(
@@ -557,10 +557,9 @@ fn oversized_http_body_has_json_error_and_no_usage() {
         token["secret"].as_str(),
         &"x".repeat(128 * 1024 * 1024 + 1),
     );
-    assert_eq!(status, 413);
-    assert!(reply.contains("request_too_large"));
-    assert!(reply.contains("128 MiB"));
-    assert!(!reply.contains("invalid JSON"));
+    assert_eq!(status, 400);
+    assert!(reply.contains("invalid JSON request body"));
+    assert!(!reply.contains("request_too_large"));
     assert_eq!(
         server.control(json!({"action":"usage", "period":"day"}))["result"]["rows"],
         json!([])
