@@ -136,6 +136,8 @@ The example model must appear in `exr models`; replace it if needed. Both config
 
 V2 defaults to WebSocket and native compaction; `--standalone` starts a private OpenCode server with the fresh configuration. OpenCode keeps its standard retry policy. See [OpenCode setup](docs/compatibility.md#opencode-setup) for transport options, configuration merging and verification scope. No plugin is required.
 
+An optional [experimental OpenCode Desktop plugin](docs/opencode-desktop.md) adds dynamic model discovery and a native Overview/Usage panel. It is built from source separately and targets OpenCode 2.2.0.
+
 ### OpenAI SDKs and other BYOK tools
 
 For a BYOK app, choose a custom OpenAI-compatible endpoint, enter your router token as the API key and select the model ID from **Models**. The app must use a [supported endpoint](docs/openai-api.md).

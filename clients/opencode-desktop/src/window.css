@@ -1,0 +1,16 @@
+.exr { padding: 20px; overflow: auto; height: 100%; font-size: 13px; line-height: 1.5; }
+.exr h2 { font-size: 18px; font-weight: 600; margin: 0 0 12px; }
+.exr h3 { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+.exr p { margin: 10px 0; }
+.exr code { overflow-wrap: anywhere; }
+.exr-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.exr-actions h2 { margin: 0; flex: 1; }
+.exr-actions label { display: flex; align-items: center; gap: 6px; }
+.exr select { color: inherit; background: var(--surface-base, transparent); border: 1px solid var(--border-base, #8886); border-radius: 5px; padding: 5px; }
+.exr-muted { opacity: .7; }
+.exr-warning { border-left: 3px solid var(--icon-warning-base, #a76f00); padding-left: 10px; }
+.exr-card { border: 1px solid var(--border-base, #8886); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.exr-window { display: flex; flex-direction: column; gap: 3px; margin: 10px 0; }
+.exr-table { overflow-x: auto; }
+.exr table { width: 100%; border-collapse: collapse; }
+.exr th, .exr td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border-base, #8886); white-space: nowrap; }

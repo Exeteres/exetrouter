@@ -10,6 +10,9 @@ from urllib.parse import urlsplit
 
 ROOT_FILES = {"AGENTS.md", "CLAUDE.md", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "CHANGELOG.md", ".gitignore", ".dockerignore", "flake.nix", "flake.lock"}
 SOURCE_DIRS = {"src", "tests", "docs", "deploy", "scripts", "skills", "prompts", ".github", "Formula"}
+DESKTOP_PLUGIN = "clients/opencode-desktop"
+DESKTOP_ROOT_FILES = {".gitignore", "README.md", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts"}
+LOCKFILE_FUNDING_HOSTS = {"feross.org", "opencollective.com", "paypal.me", "tidelift.com", "www.patreon.com"}
 SECRET_PATTERNS = [
     re.compile(r"\bexr_tok_[0-9a-f]{16}_[0-9a-f]{64}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b"),
@@ -23,7 +26,16 @@ HOSTS = {"github.com", "api.github.com", "codeload.github.com", "raw.githubuserc
 
 def allowed_path(name):
     parts = Path(name).parts
-    if not parts or parts[0] not in ROOT_FILES | SOURCE_DIRS:
+    if not parts:
+        return False
+    if parts[0] == "clients":
+        if len(parts) < 3 or parts[1] != "opencode-desktop":
+            return False
+        if not (len(parts) == 3 and parts[2] in DESKTOP_ROOT_FILES) and not (
+            parts[2] in {"src", "tests"} and Path(name).suffix in {".ts", ".tsx", ".css"}
+        ):
+            return False
+    elif parts[0] not in ROOT_FILES | SOURCE_DIRS:
         return False
     return not any(p in {"target", ".local-state", ".git", "node_modules", "__pycache__"} for p in parts) and not (
         name.endswith((".sqlite", ".sqlite-shm", ".sqlite-wal", ".db", ".key", ".pem", ".p12", ".pfx", ".log", ".pyc"))
@@ -64,7 +76,7 @@ def main():
             paths = [root / name for name in names if name]
         else:
             paths = []
-            for entry in ROOT_FILES | SOURCE_DIRS:
+            for entry in ROOT_FILES | SOURCE_DIRS | {DESKTOP_PLUGIN}:
                 candidate = root / entry
                 if candidate.is_file():
                     paths.append(candidate)
@@ -91,7 +103,8 @@ def main():
                     host = urlsplit(match.group().rstrip(".,;:")).hostname
                 except ValueError:
                     continue  # Deliberately malformed URL fixtures.
-                if not allowed_host(host):
+                reviewed_funding = name == f"{DESKTOP_PLUGIN}/package-lock.json" and host in LOCKFILE_FUNDING_HOSTS
+                if not allowed_host(host) and not reviewed_funding:
                     errors.append((name, "unreviewed concrete endpoint"))
                     break
     for name, rule in errors:
