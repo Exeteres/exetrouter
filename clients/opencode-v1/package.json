@@ -1,0 +1,8 @@
+{
+  "name": "exetrouter-opencode-v1-context",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test context.test.js"
+  }
+}

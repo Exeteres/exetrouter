@@ -12,6 +12,7 @@ ROOT_FILES = {"AGENTS.md", "CLAUDE.md", "Cargo.toml", "Cargo.lock", "README.md",
 SOURCE_DIRS = {"src", "tests", "docs", "deploy", "scripts", "skills", "prompts", ".github", "Formula"}
 DESKTOP_PLUGIN = "clients/opencode-desktop"
 DESKTOP_ROOT_FILES = {".gitignore", "README.md", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts"}
+V1_FILES = {"README.md", "package.json", "context.js", "context.test.js"}
 LOCKFILE_FUNDING_HOSTS = {"feross.org", "opencollective.com", "paypal.me", "tidelift.com", "www.patreon.com"}
 SECRET_PATTERNS = [
     re.compile(r"\bexr_tok_[0-9a-f]{16}_[0-9a-f]{64}\b"),
@@ -29,6 +30,8 @@ def allowed_path(name):
     if not parts:
         return False
     if parts[0] == "clients":
+        if len(parts) == 3 and parts[1] == "opencode-v1":
+            return parts[2] in V1_FILES
         if len(parts) < 3 or parts[1] != "opencode-desktop":
             return False
         if not (len(parts) == 3 and parts[2] in DESKTOP_ROOT_FILES) and not (
@@ -76,7 +79,7 @@ def main():
             paths = [root / name for name in names if name]
         else:
             paths = []
-            for entry in ROOT_FILES | SOURCE_DIRS | {DESKTOP_PLUGIN}:
+            for entry in ROOT_FILES | SOURCE_DIRS | {DESKTOP_PLUGIN, "clients/opencode-v1"}:
                 candidate = root / entry
                 if candidate.is_file():
                     paths.append(candidate)

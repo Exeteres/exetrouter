@@ -23,6 +23,7 @@ jobs:
       - run: cargo fmt --check
       - run: python3 scripts/test-compat-agent.py
       - run: python3 scripts/test-native-tools.py
+      - run: node --test clients/opencode-v1/context.test.js
       - name: Publication, package and Docker updater checks
         run: |
           python3 scripts/check-publication.py
