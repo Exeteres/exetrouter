@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 0.8.0
+
+- Add an experimental OpenCode Desktop provider and usage-dashboard plugin with a separate client build and test workflow; enabling it remains an explicit client-side action.
 - Expose a bearer-authenticated `/mcp` Streamable HTTP endpoint with agent-discoverable `generate_image`/`edit_image` tools and native image results. Reuse native routing/quota/accounting, scope legacy cancellation to user/client sessions, and bound/cancel response streams without replay. Support modern and legacy MCP discovery; include Codex/OpenCode configuration, SDK fixtures and explicit ingress routing. New tools are discovered on catalog refresh/reconnect, not via a claimed live notification service.
 - Add native Codex JSON image generation/editing and standalone search routes, with separate feature pauses, private user-scoped search affinity, bounded output and durable unknown-aware accounting. Include a shell-agent image helper in the exr skill; unmodified Codex's native image-tool auth gate remains an explicit limitation. Schema 13 requires the reviewed migration/rollback in `docs/native-tools.md`; no automatic deployment or live inference is implied.
 - Remove router-defined inference request-size ceilings for HTTP, compressed/decoded zstd and client WebSockets, including bundled nginx ingress. Leave model/context validation to upstream while retaining authorization, concurrency, decoder deadlines and output/recovery bounds.

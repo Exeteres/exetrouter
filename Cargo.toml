@@ -1,13 +1,14 @@
 [package]
 name = "exetrouter"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.88"
 description = "A privacy-conscious Codex/OpenCode model router with SSH management"
 repository = "https://github.com/mocki-toki/exetrouter"
 readme = "README.md"
-include = ["src/**", "tests/**", "docs/**", "deploy/**", "scripts/*.py", "scripts/*.sh", "scripts/compat_agent/*.py", "scripts/compat_agent/Dockerfile", "skills/**", "prompts/**", "Cargo.lock", "README.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "CHANGELOG.md", "AGENTS.md", "CLAUDE.md"]
+# Root-only documents must not pull in nested dependency README/LICENSE files.
+include = ["src/**", "tests/**", "docs/**", "deploy/**", "scripts/*.py", "scripts/*.sh", "scripts/compat_agent/*.py", "scripts/compat_agent/Dockerfile", "skills/**", "prompts/**", "/Cargo.lock", "/README.md", "/LICENSE", "/SECURITY.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/AGENTS.md", "/CLAUDE.md"]
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
