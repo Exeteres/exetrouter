@@ -67,7 +67,9 @@ The example model must appear in `exr models`; `exetrouter/gpt-5.6-sol` is provi
 
 Both exports import pool metadata under a dedicated `exetrouter` provider without inheriting the bundled OpenAI catalog. V1 uses `provider`, `@ai-sdk/openai`, options and variant objects. V2 uses `providers`, `@opencode/ai/providers/openai/responses`, settings and variant arrays. V2 defaults to WS, `store=false` and native compaction; set `providers.exetrouter.settings.transport` to `http` for SSE. `--standalone` makes a private OpenCode server read the fresh file.
 
-Regenerate the configuration after account-pool or model changes. Keep this provider's definition in the generated file to avoid merging old model entries; unrelated settings stay in regular configuration. No plugin is needed. OpenCode keeps its standard retries. Exported providers passed mock model/tool checks in V1 1.18.34 and V2 2.0.22. V1 WS, live upstream, compaction and long context remain unverified; repository `docs/compatibility.md` records the full evidence.
+Regenerate the configuration after account-pool or model changes. Keep this provider's definition in the generated file to avoid merging old model entries; unrelated settings stay in regular configuration. OpenCode keeps its standard retries. Exported providers passed mock model/tool checks in V1 1.18.34 and V2 2.0.22. V1 WS, live upstream, live compaction and long context remain unverified; repository `docs/compatibility.md` records the full evidence.
+
+For V1 plaintext compaction with retained history, install the repository's `clients/opencode-v1/context.js` in that V1 configuration's `plugins/` directory, then reopen the existing session. It removes only the compaction summary's ExetRouter-enveloped hidden reasoning from outgoing copies; the visible summary, tail messages/tools and transfer receipts remain unchanged. This prevents independent summary routing from causing `context_account_mismatch` and was reproduced/recovered offline on V1 1.18.30. Do not delete history or relax server ownership checks. Codex/V2 native checkpoints do not need this plugin.
 
 ## MCP image tools
 

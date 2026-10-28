@@ -11,12 +11,13 @@ Supply your router endpoint, bearer token and an account-visible model. The setu
 | October 4, 2026 | OpenCode V1 1.18.34, V2 2.0.22 | Exported-provider model lists and mock tool cycles; V1 HTTP/SSE plus resume, V2 HTTP/SSE and WS. |
 | October 5, 2026 | Codex 0.160.0, OpenCode V2 2.0.23 | Synthetic HTTP/WS tool cycles, remote compaction, client reopen and router restart with client-carried ownership proofs; quota-switch continuations. |
 | October 24, 2026 | Codex 0.164.0, OpenCode V2 2.1.4 | Targeted synthetic quota transfer with encrypted history, client-carried portability receipt, router restart, process reopen and model switch/back on HTTP/WS. Not a renewal of the full upstream matrix. |
+| October 29, 2026 | OpenCode V1 1.18.30 | Reproduced plaintext-compaction/retained-tail account conflict; bundled request-copy plugin recovers the same saved session across router/client restart. Synthetic HTTP/SSE only. |
 
 The [source manifest](protocol-sources.json) pins reviewed revisions. The [protocol audit](native-protocol-audit.md) records source-level contracts; [live-testing.md](live-testing.md) records measured runs, failed probes and request counts. Later versions need source review and new fixtures.
 
 Codex WS interruption fixtures counted one generation for early close, partial output and missing terminal. Both current clients passed synthetic quota-switch continuations. A completed tool item may run before the response terminal, and a lost connection may prevent delivery of a terminal error.
 
-Full advertised context windows, multi-hour sessions, saturation and actual upstream authentication/quota outages remain unverified. OpenCode V1's experimental WS transport, live upstream, compaction and long context, and Codex Desktop are outside the verified execution matrix.
+Full advertised context windows, multi-hour sessions, saturation and actual upstream authentication/quota outages remain unverified. OpenCode V1's experimental WS transport, live upstream, live compaction and long context, and Codex Desktop are outside the verified execution matrix.
 
 ## Configure your client
 
@@ -79,6 +80,14 @@ Then start OpenCode:
 OPENCODE_CONFIG="$PWD/exetrouter-v1.json" opencode --model exetrouter/gpt-5.6-sol
 ```
 
+V1's plaintext compaction can combine an independent summary and a retained tail
+from different pool accounts. Install the bundled
+[V1 context plugin](../clients/opencode-v1/README.md) on that client before using
+long sessions. It omits only the summary's router-enveloped hidden reasoning
+from outgoing copies; summary text, original history and transfer proofs remain.
+It can recover an already affected session without editing its database. V2 and
+Codex native compaction do not use this plugin.
+
 ### V2 (@opencode/cli)
 
 Create the configuration:
@@ -116,6 +125,23 @@ python3 scripts/fetch-test-clients.py --opencode-v1 --sources
 export EXETROUTER_OPENCODE_V1_BIN="$(python3 -c 'import json; print(json.load(open("target/compat/current-opencode-v1.json"))["binary"])')"
 cargo test --locked --test responses opencode_v1_http_compatibility_probe -- --ignored --nocapture
 ```
+
+The targeted compaction fixture pins V1 **1.18.30**
+(`3104c1428ec91f809e5ab86631300de41eb6952e`), whose reviewed
+`session/compaction.ts` serializes the summary input as plaintext, retains a tail
+and then replays the summary's reasoning through `session/message-v2.ts`.
+Current stable V1 resolved to **1.19.5**
+(`810c0eba1a7348036f8bdf61e6632d0c36c6876c`); its message/processor source review
+is not a native compaction execution claim for that version.
+
+`opencode_v1_compaction_preserves_tail_across_independent_summary_account`
+reproduces the unmodified 400 before inference, installs the request-copy plugin
+into the isolated client profile, and reopens that same saved session after a
+router restart. It checks exact original tail reasoning/tool results, omission
+of only the summary reasoning, and preservation of new ordinary reasoning and
+transfer receipts on another reopen. Four synthetic admissions complete; no
+real account, inference or reset credit is used. Run the plugin's dependency-free
+unit tests with `node --test clients/opencode-v1/context.test.js`.
 
 ## Resolve and run native fixtures
 
