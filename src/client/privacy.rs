@@ -359,6 +359,10 @@ fn decorate_account_clients(vault: Option<&Vault>, report: &mut Value) {
             .into_iter()
             .flatten()
         {
+            if client["owned"] == false {
+                client["name"] = "Other user's client".into();
+                continue;
+            }
             let label = client["name"].as_str().and_then(|name| {
                 if name.starts_with(PREFIX) {
                     vault
@@ -442,12 +446,16 @@ mod tests {
             scope: b"synthetic".to_vec(),
         };
         let name = vault.encrypt("token-name", b"Laptop - Codex").unwrap();
-        let raw = serde_json::json!({"quota_accounts":[{"clients":{"rows":[{"id":"tok_synthetic","name":name}]}}]});
+        let raw = serde_json::json!({"quota_accounts":[{"clients":{"rows":[{"id":"tok_synthetic","name":name},{"id":"client_alias","owned":false,"name":name}]}}]});
         let mut decoded = raw.clone();
         decorate_account_clients(Some(&vault), &mut decoded);
         assert_eq!(
             decoded["quota_accounts"][0]["clients"]["rows"][0]["name"],
             "Laptop - Codex"
+        );
+        assert_eq!(
+            decoded["quota_accounts"][0]["clients"]["rows"][1]["name"],
+            "Other user's client"
         );
         for key in [
             None,
@@ -464,6 +472,10 @@ mod tests {
             );
             assert!(!hidden.to_string().contains(PREFIX));
             assert!(!hidden.to_string().contains("Laptop - Codex"));
+            assert_eq!(
+                hidden["quota_accounts"][0]["clients"]["rows"][1]["name"],
+                "Other user's client"
+            );
         }
     }
     #[tokio::test]

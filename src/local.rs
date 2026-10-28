@@ -231,9 +231,10 @@ impl Local {
                     .account_metadata(&mut report, live, user)
                     .await;
                 let mut value = serde_json::to_value(report)?;
+                let key = self.key.clone();
                 self.db
                     .call(move |conn| {
-                        crate::account_preferences::annotate(conn, user, &mut value)?;
+                        crate::account_preferences::annotate(conn, &key, user, &mut value)?;
                         Ok(value)
                     })
                     .await

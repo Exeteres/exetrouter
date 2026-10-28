@@ -3701,7 +3701,7 @@ mod tests {
         state.values[OVERVIEW] = Some(serde_json::json!({"quota_accounts":[{
             "id":1,"label":"Synthetic","preference":{"enabled":true},
             "routing":{"best":true,"observed_at":now,"reason":"weekly_reset_soon","target_share_percent":100.0},
-            "quota":{"windows":[]},"clients":{"count":1,"observed_at":now,"rows":[{"id":"tok_synthetic","name":"Laptop - Codex","last_request_at":now-12,"in_flight":1}]}
+            "quota":{"windows":[]},"clients":{"scope":"server","count":2,"observed_at":now,"rows":[{"id":"tok_synthetic","name":"Laptop - Codex","last_request_at":now-12,"in_flight":1},{"id":"client_synthetic","name":"Other user's client","owned":false,"last_request_at":now-20,"in_flight":0}]}
         }]}));
         terminal
             .draw(|f| render(f, &state, &Connection::default(), false))
@@ -3713,7 +3713,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(text.contains("Best"));
-        assert!(text.contains("Clients: 1"));
+        assert!(text.contains("Clients: 2"));
         let badge = buffer
             .content
             .windows(4)
@@ -3724,6 +3724,8 @@ mod tests {
         assert!(details.contains("Laptop - Codex"));
         assert!(details.contains("12s ago"));
         assert!(details.contains("Running: 1"));
+        assert!(details.contains("all users' recently active tokens"));
+        assert!(details.contains("Other user's client"));
         state.modal = Some(Modal::Account { id: 1, scroll: 7 });
         terminal
             .draw(|f| render(f, &state, &Connection::default(), false))

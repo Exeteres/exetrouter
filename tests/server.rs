@@ -269,6 +269,56 @@ fn authentication_runs_before_json_extraction() {
 }
 
 #[test]
+fn doctor_shares_global_client_presence_without_foreign_token_metadata_or_management() {
+    let server = Server::start();
+    let own = server.token()["token"]["id"].as_str().unwrap().to_owned();
+    let conn = rusqlite::Connection::open(server.dir.path().join("state.sqlite")).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let other = exetrouter::create_user(&conn, "other").unwrap();
+    let key = fs::read(server.dir.path().join("secret.key")).unwrap();
+    let foreign = exetrouter::create_token(&conn, &key, other, "foreign-private-label", 1).unwrap();
+    conn.execute("INSERT INTO oauth_accounts(account_id,state,encrypted_credentials,expires_at,catalog_updated_at,created_at) VALUES('synthetic','active',X'00',?1,?2,?2)",rusqlite::params![now+3600,now]).unwrap();
+    for (owner, token, age) in [(1, own.as_str(), 10), (other, foreign.token.id.as_str(), 5)] {
+        conn.execute("INSERT INTO usage_events(at_utc,user_id,token_id,account_id,api_surface,model,status,request_id) VALUES(?1,?2,?3,1,'responses','synthetic','completed',?3)",rusqlite::params![now-age,owner,token]).unwrap();
+    }
+    let report = server.control(json!({"action":"doctor"}));
+    assert_eq!(report["ok"], true);
+    assert_eq!(
+        report["result"]["capabilities"]["global_account_clients"],
+        1
+    );
+    let clients = &report["result"]["quota_accounts"][0]["clients"];
+    assert_eq!(clients["scope"], "server");
+    assert_eq!(clients["count"], 2);
+    assert_eq!(clients["rows"][0]["owned"], false);
+    let alias = clients["rows"][0]["id"].as_str().unwrap();
+    assert!(alias.starts_with("client_"));
+    assert_eq!(clients["rows"][0]["last_request_at"], now - 5);
+    assert_eq!(clients["rows"][1]["id"], own);
+    assert!(!report.to_string().contains(&foreign.token.id));
+    assert!(!report.to_string().contains("foreign-private-label"));
+    let again = server.control(json!({"action":"doctor"}));
+    assert_eq!(
+        again["result"]["quota_accounts"][0]["clients"]["rows"][0]["id"],
+        alias
+    );
+    for id in [alias, foreign.token.id.as_str()] {
+        assert_eq!(
+            server.control(json!({"action":"token_show","id":id}))["ok"],
+            false
+        );
+        assert_eq!(
+            server.control(json!({"action":"token_revoke","id":id}))["result"]["revoked"],
+            false
+        );
+    }
+    let usage = server.control(json!({"action":"usage","period":"day","by":"token"}));
+    assert_eq!(usage["result"]["rows"].as_array().unwrap().len(), 1);
+    assert!(!usage.to_string().contains("foreign-private-label"));
+    assert!(!usage.to_string().contains(&foreign.token.id));
+}
+
+#[test]
 fn doctor_is_authenticated_read_only_and_redacts_account_data_through_the_cli() {
     let server = Server::start();
     let first = server.control(json!({"action":"doctor"}));

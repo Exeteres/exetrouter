@@ -497,10 +497,11 @@ async fn process_control(
         }
         let mut value = serde_json::to_value(report)
             .map_err(|_| invalid("storage_unavailable", "server diagnostics unavailable"))?;
+        let key = state.key.clone();
         value = state
             .db
             .call(move |conn| {
-                crate::account_preferences::annotate(conn, user_id, &mut value)?;
+                crate::account_preferences::annotate(conn, &key, user_id, &mut value)?;
                 Ok(value)
             })
             .await

@@ -432,7 +432,12 @@ pub(super) fn account_details(account: &Value, now: i64) -> String {
         text.push_str("Client activity unavailable on this server.");
         return text;
     };
-    text.push_str(&format!("Clients: {count} · your recently active tokens\n"));
+    let scope = if account["clients"]["scope"] == "server" {
+        "all users' recently active tokens"
+    } else {
+        "your recently active tokens"
+    };
+    text.push_str(&format!("Clients: {count} · {scope}\n"));
     if account["clients"]["observed_at"]
         .as_i64()
         .is_some_and(|at| !crate::routing::fresh(at, now))

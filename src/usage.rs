@@ -132,31 +132,44 @@ pub fn recover_requests(conn: &Connection) -> Result<usize> {
 pub(crate) const CLIENT_IDLE_SECONDS: i64 = 15 * 60;
 const MAX_ACCOUNT_CLIENTS: usize = 128;
 
-/// User-scoped recent inference tokens, not connected applications or sockets.
+/// Server-wide recent inference tokens, not connected applications or sockets.
+/// Only the viewer's token IDs/labels are exposed; other tokens get keyed aliases.
 /// Long-running durable admissions remain visible until finalization/recovery.
 pub(crate) fn clients_by_account(
     conn: &Connection,
+    key: &[u8],
     user: i64,
     now: i64,
 ) -> Result<std::collections::BTreeMap<i64, serde_json::Value>> {
     let mut stmt = conn.prepare(
         "WITH clients AS (
-           SELECT e.account_id,e.token_id,t.name,MAX(e.at_utc) AS last_request_at,SUM(e.status IN ('accepted','sent')) AS in_flight
+           SELECT e.account_id,e.token_id,e.user_id=?1 AS owned,
+             CASE WHEN e.user_id=?1 THEN t.name END AS name,
+             MAX(e.at_utc) AS last_request_at,SUM(e.status IN ('accepted','sent')) AS in_flight
            FROM usage_events e JOIN access_tokens t ON t.id=e.token_id AND t.user_id=e.user_id
            JOIN oauth_accounts a ON a.id=e.account_id AND a.state='active'
-           WHERE e.user_id=?1 AND e.at_utc<=?2 AND (e.at_utc>?3 OR e.status IN ('accepted','sent'))
+           WHERE e.at_utc<=?2 AND (e.at_utc>?3 OR e.status IN ('accepted','sent'))
            GROUP BY e.account_id,e.token_id
          ), ranked AS (
            SELECT *,COUNT(*) OVER (PARTITION BY account_id) AS total,
              ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY in_flight>0 DESC,last_request_at DESC,token_id) AS position FROM clients
-         ) SELECT account_id,token_id,name,last_request_at,in_flight,total FROM ranked WHERE position<=?4 ORDER BY account_id,position"
+         ) SELECT account_id,token_id,name,last_request_at,in_flight,total,owned FROM ranked WHERE position<=?4 ORDER BY account_id,position"
     )?;
     let rows=stmt.query_map(params![user,now,now.saturating_sub(CLIENT_IDLE_SECONDS),MAX_ACCOUNT_CLIENTS],|row| {
-        Ok((row.get::<_,i64>(0)?,row.get::<_,usize>(5)?,serde_json::json!({"id":row.get::<_,String>(1)?,"name":row.get::<_,String>(2)?,"last_request_at":row.get::<_,i64>(3)?,"in_flight":row.get::<_,usize>(4)?})))
+        Ok((row.get::<_,i64>(0)?,row.get::<_,usize>(5)?,serde_json::json!({"id":row.get::<_,String>(1)?,"name":row.get::<_,Option<String>>(2)?,"last_request_at":row.get::<_,i64>(3)?,"in_flight":row.get::<_,usize>(4)?,"owned":row.get::<_,bool>(6)?})))
     })?;
     let mut accounts = std::collections::BTreeMap::new();
     for row in rows {
-        let (account, count, client) = row?;
+        let (account, count, mut client) = row?;
+        if client["owned"] == false {
+            use hmac::{Hmac, Mac};
+            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key)?;
+            mac.update(b"exetrouter-global-client-v1\0");
+            mac.update(client["id"].as_str().expect("token ID").as_bytes());
+            client["id"] =
+                format!("client_{}", hex::encode(&mac.finalize().into_bytes()[..16])).into();
+            client["name"] = "Other user's client".into();
+        }
         let activity = accounts
             .entry(account)
             .or_insert_with(|| empty_clients(now));
@@ -171,7 +184,7 @@ pub(crate) fn clients_by_account(
 }
 
 pub(crate) fn empty_clients(now: i64) -> serde_json::Value {
-    serde_json::json!({"count":0,"rows":[],"idle_seconds":CLIENT_IDLE_SECONDS,"observed_at":now,"truncated":false})
+    serde_json::json!({"scope":"server","count":0,"rows":[],"idle_seconds":CLIENT_IDLE_SECONDS,"observed_at":now,"truncated":false})
 }
 
 #[cfg(test)]
@@ -181,7 +194,7 @@ fn account_clients(
     account: i64,
     now: i64,
 ) -> Result<serde_json::Value> {
-    Ok(clients_by_account(conn, user, now)?
+    Ok(clients_by_account(conn, &[1; 32], user, now)?
         .remove(&account)
         .unwrap_or_else(|| empty_clients(now)))
 }
@@ -540,11 +553,12 @@ mod tests {
     }
 
     #[test]
-    fn account_clients_are_scoped_deduplicated_expire_and_recover_running_requests() {
+    fn account_clients_are_global_private_deduplicated_expire_and_recover_running_requests() {
         let db = Connection::open_in_memory().unwrap();
         init(&db).unwrap();
         let user = create_user(&db, "client-owner").unwrap();
         let other = create_user(&db, "other-owner").unwrap();
+        let observer = create_user(&db, "observer").unwrap();
         let recent = create_token(&db, &[1; 32], user, "shared label", 1)
             .unwrap()
             .token
@@ -569,16 +583,47 @@ mod tests {
         insert(user, &recent, 2, now - 5, "completed", "second-account");
         insert(user, &running, 1, now - 3600, "sent", "long-request");
         insert(other, &hidden, 1, now - 1, "accepted", "foreign-request");
+        insert(
+            other,
+            &hidden,
+            2,
+            now - 1,
+            "completed",
+            "foreign-second-account",
+        );
         let report = account_clients(&db, user, 1, now).unwrap();
-        assert_eq!(report["count"], 2);
-        assert_eq!(report["rows"][0]["id"], running);
+        assert_eq!(report["scope"], "server");
+        assert_eq!(report["count"], 3);
+        assert_eq!(report["rows"][0]["owned"], false);
+        assert_eq!(report["rows"][0]["name"], "Other user's client");
         assert_eq!(report["rows"][0]["in_flight"], 1);
-        assert_eq!(report["rows"][1]["last_request_at"], now - 10);
+        assert_eq!(report["rows"][0]["last_request_at"], now - 1);
+        assert_eq!(report["rows"][1]["id"], running);
+        assert_eq!(report["rows"][1]["owned"], true);
+        assert_eq!(report["rows"][1]["in_flight"], 1);
+        assert_eq!(report["rows"][2]["last_request_at"], now - 10);
+        assert_eq!(report["rows"][2]["name"], "shared label");
         assert!(!report.to_string().contains("foreign"));
-        assert_eq!(account_clients(&db, user, 2, now).unwrap()["count"], 1);
+        assert!(!report.to_string().contains(&hidden));
+        let second = account_clients(&db, user, 2, now).unwrap();
+        assert_eq!(second["count"], 2);
+        assert_eq!(second["rows"][0]["id"], report["rows"][0]["id"]);
+        assert_eq!(report, account_clients(&db, user, 1, now).unwrap());
+        let observed = account_clients(&db, observer, 1, now).unwrap();
+        assert_eq!(observed["count"], 3);
+        assert_eq!(observed["rows"][0], report["rows"][0]);
+        for id in [&recent, &running, &hidden] {
+            assert!(!observed.to_string().contains(id));
+        }
+        let owned = account_clients(&db, other, 1, now).unwrap();
+        assert_eq!(owned["count"], 3);
+        assert_eq!(owned["rows"][0]["id"], hidden);
+        assert_eq!(owned["rows"][0]["name"], "foreign private name");
+        let different_key = clients_by_account(&db, &[2; 32], user, now).unwrap();
+        assert_ne!(different_key[&1]["rows"][0]["id"], report["rows"][0]["id"]);
         assert_eq!(
             account_clients(&db, user, 1, now + CLIENT_IDLE_SECONDS - 10).unwrap()["count"],
-            1
+            2
         );
         recover_requests(&db).unwrap();
         assert_eq!(
@@ -604,10 +649,12 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         init(&db).unwrap();
         let user = create_user(&db, "synthetic").unwrap();
+        let other = create_user(&db, "other").unwrap();
         db.execute("INSERT INTO oauth_accounts(id,account_id,state,encrypted_credentials,expires_at,created_at) VALUES(1,'synthetic','active',X'00',999999,0)",[]).unwrap();
         let now = 100_000;
         for i in 0..130 {
-            let token = create_token(&db, &[1; 32], user, "Synthetic client", 1)
+            let owner = if i % 2 == 0 { user } else { other };
+            let token = create_token(&db, &[1; 32], owner, "Synthetic client", 1)
                 .unwrap()
                 .token
                 .id;
@@ -616,13 +663,15 @@ mod tests {
             } else {
                 (now - i, "completed")
             };
-            db.execute("INSERT INTO usage_events(at_utc,user_id,token_id,account_id,api_surface,model,status,request_id) VALUES(?1,?2,?3,1,'responses','synthetic',?4,?5)",params![at,user,token,status,format!("synthetic-request-{i}")]).unwrap();
+            db.execute("INSERT INTO usage_events(at_utc,user_id,token_id,account_id,api_surface,model,status,request_id) VALUES(?1,?2,?3,1,'responses','synthetic',?4,?5)",params![at,owner,token,status,format!("synthetic-request-{i}")]).unwrap();
         }
         let report = account_clients(&db, user, 1, now).unwrap();
         assert_eq!(report["count"], 130);
         assert_eq!(report["rows"].as_array().unwrap().len(), 128);
         assert_eq!(report["truncated"], true);
         assert_eq!(report["rows"][0]["in_flight"], 1);
+        assert_eq!(report["rows"][0]["owned"], false);
+        assert_eq!(account_clients(&db, other, 1, now).unwrap()["count"], 130);
     }
 
     fn timestamp(text: &str) -> DateTime<Utc> {

@@ -83,14 +83,29 @@ pub fn set_policy_rules(
     tx.commit()?;
     Ok(result)
 }
-pub fn annotate(conn: &Connection, user: i64, value: &mut serde_json::Value) -> Result<()> {
+pub fn annotate(
+    conn: &Connection,
+    key: &[u8],
+    user: i64,
+    value: &mut serde_json::Value,
+) -> Result<()> {
+    annotate_at(conn, key, user, value, chrono::Utc::now().timestamp())
+}
+
+fn annotate_at(
+    conn: &Connection,
+    key: &[u8],
+    user: i64,
+    value: &mut serde_json::Value,
+    now: i64,
+) -> Result<()> {
     value["capabilities"]["automatic_account_routing"] = serde_json::json!(1);
     value["capabilities"]["automatic_reset_credits"] = serde_json::json!(1);
-    let now = chrono::Utc::now().timestamp();
+    value["capabilities"]["global_account_clients"] = serde_json::json!(1);
     if let Some(rows) = value["quota_accounts"].as_array_mut() {
         let mut candidates = Vec::new();
         // Scan activity once per snapshot, not once per account.
-        let mut clients = crate::usage::clients_by_account(conn, user, now)?;
+        let mut clients = crate::usage::clients_by_account(conn, key, user, now)?;
         for row in rows.iter_mut() {
             if let Some(id) = row["id"].as_i64() {
                 let preference = effective(conn, id)?;
@@ -117,6 +132,7 @@ pub fn annotate(conn: &Connection, user: i64, value: &mut serde_json::Value) -> 
                 }
                 row["threshold_reached"] = serde_json::json!(reached);
                 row["routing"] = serde_json::to_value(routing)?;
+                row["routing"]["scope"] = "server".into();
                 row["routing"]["best"] = false.into();
                 row["routing"]["observed_at"] = now.into();
                 row["routing"]["valid_until"] = quota
@@ -155,10 +171,11 @@ pub fn annotate(conn: &Connection, user: i64, value: &mut serde_json::Value) -> 
 mod tests {
     use super::*;
     #[test]
-    fn best_and_shares_follow_fresh_capacity_and_operator_availability() {
+    fn best_and_shares_are_global_and_follow_fresh_capacity_and_operator_availability() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::store::init(&conn).unwrap();
         let user = crate::create_user(&conn, "synthetic").unwrap();
+        let other = crate::create_user(&conn, "other").unwrap();
         let now = chrono::Utc::now().timestamp();
         for (id, used, days) in [(1, 40.0, 6), (2, 20.0, 4)] {
             conn.execute("INSERT INTO oauth_accounts(id,account_id,state,encrypted_credentials,expires_at,catalog_updated_at,created_at) VALUES(?1,?2,'active',X'00',?3,?4,0)",params![id,format!("synthetic-{id}"),now+3600,now]).unwrap();
@@ -166,9 +183,27 @@ mod tests {
             crate::routing::save(&conn, id, 0, 0, now, Some(true), None).unwrap();
             conn.execute("INSERT INTO oauth_quota_windows(account_id,kind,used_percent,window_minutes,reset_at,observed_at,request_order) VALUES(?1,'secondary',?2,10080,?3,?4,0)",params![id,used,now+days*86400,now]).unwrap();
         }
+        conn.execute(
+            "INSERT INTO account_preferences(user_id,account_id,enabled) VALUES(?1,1,0),(?2,2,0)",
+            params![user, other],
+        )
+        .unwrap();
         let snapshot = |conn: &Connection| {
             let mut value = serde_json::json!({"quota_accounts":[{"id":1},{"id":2}]});
-            annotate(conn, user, &mut value).unwrap();
+            annotate_at(conn, &[1; 32], user, &mut value, now).unwrap();
+            let mut other_value = serde_json::json!({"quota_accounts":[{"id":1},{"id":2}]});
+            annotate_at(conn, &[1; 32], other, &mut other_value, now).unwrap();
+            for i in 0..2 {
+                assert_eq!(value["quota_accounts"][i]["routing"]["scope"], "server");
+                assert_eq!(
+                    value["quota_accounts"][i]["routing"],
+                    other_value["quota_accounts"][i]["routing"]
+                );
+                assert_eq!(
+                    value["quota_accounts"][i]["clients"]["count"],
+                    other_value["quota_accounts"][i]["clients"]["count"]
+                );
+            }
             value
         };
         let value = snapshot(&conn);
