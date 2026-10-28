@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Remove personal account activation and custom account labels from the dashboard, CLI and management protocol. Ignore retired personal availability records; preserve operator account controls, encrypted token names and dashboard preferences without a schema change.
+
 ## 0.8.0
 
 - Add an experimental OpenCode Desktop provider and usage-dashboard plugin with a separate client build and test workflow; enabling it remains an explicit client-side action.

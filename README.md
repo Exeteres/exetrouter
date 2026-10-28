@@ -183,7 +183,7 @@ Responses, streaming and supported Chat Completions share the endpoint; see the 
 
 - The router never logs or stores prompts, messages, outputs, tool payloads, authorization headers or request/response bodies. It retains usage counters, operational metadata and keyed context digests. See [security and privacy](SECURITY.md).
 - Content passes through server memory. A host operator can inspect memory or replace the software; this is not end-to-end encryption against that operator.
-- Personal metadata uses a client-held key created automatically by the native client: token names, account labels and dashboard preferences. Edit account labels from Overview. See [encrypted personal data](docs/private-metadata.md) for key backup and recovery.
+- Token names and dashboard preferences use a client-held key created automatically by the native client. Accounts use issuer-provided email labels. See [encrypted personal data](docs/private-metadata.md) for key backup and recovery.
 - Supported calls use ChatGPT Codex OAuth, not upstream Platform API keys. See the [API contract](docs/openai-api.md) for endpoints and limits.
 - Conversations normally stay on their originating account. [Quota failover](docs/account-pool.md#failure-behavior) requires complete current context.
 - Management uses restricted SSH and an authenticated Unix socket. There is no public HTTP admin API or per-minute/IP quota.

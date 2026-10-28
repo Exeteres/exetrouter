@@ -46,10 +46,10 @@ Without saved config, local development defaults to files in the working directo
 | `admin oauth add --device` | Browser sign-in; save encrypted upstream credentials |
 | `admin oauth reauth ID --device` | Reauthorize the same upstream account |
 | `admin oauth list` | Show account email and state without tokens (`email` is null when unavailable in the saved credentials) |
-| `admin oauth policy ID --enabled false --locked true` | Reversibly deactivate routing for all users and prevent client changes |
-| `admin oauth policy ID --enabled true --locked true` | Activate routing and lock personal activation changes (OAuth must remain healthy) |
-| `admin oauth policy ID --locked false` | Unlock personal preference changes, preserving existing preferences |
-| `admin oauth disable ID` | Reversibly deactivate routing for everyone and lock client changes; retain OAuth state |
+| `admin oauth policy ID --enabled false` | Reversibly deactivate routing for all users |
+| `admin oauth policy ID --enabled true` | Activate routing (OAuth must remain healthy) |
+| `admin oauth policy ID --locked true` | Preserve the operator lock marker for older clients and rollback; personal availability changes are no longer supported |
+| `admin oauth disable ID` | Reversibly deactivate routing for everyone; retain OAuth state and set the legacy lock marker |
 | `admin oauth enable ID` | Reactivate routing while preserving the operator lock |
 | `admin backup create --to PATH` | Snapshot live SQLite state and both keys |
 | `admin backup verify --from PATH` | Verify private snapshot integrity/decryptability offline |

@@ -1,6 +1,6 @@
 # Encrypted personal metadata
 
-ExetRouter encrypts personal metadata on the native client with XChaCha20-Poly1305. The service stores ciphertext and never receives the privacy key. This covers token names, personal account labels and dashboard preferences. It does not encrypt routing rules, account issuer identities, usage counters, or connection settings required to reach the service.
+ExetRouter encrypts personal metadata on the native client with XChaCha20-Poly1305. The service stores ciphertext and never receives the privacy key. This covers token names and dashboard preferences. It does not encrypt account issuer identities, usage counters, or connection settings required to reach the service.
 
 The client creates its key automatically on first use. By default it is next to the selected client config, replacing its extension with `.privacy-key`; `EXR_PRIVACY_KEY` selects another local key file. Keys must be owner-only regular 32-byte files; symlinks are rejected. The key is never uploaded. Back it up separately and privately: server backups cannot recover it, and losing every copy makes encrypted data unreadable.
 
@@ -10,7 +10,9 @@ Rename a token through Tokens → Enter → Rename token or `exr tokens rename I
 
 Before migrating plaintext names, the client verifies that it can decrypt every encrypted name in the list. An unavailable privacy key does not block unrelated management operations such as model/usage reports or token revocation.
 
-Use Enter on an account in Overview and choose “Edit personal account label”. Empty values remove the corresponding item. Values are limited to 8192 bytes and labels to 256 bytes. There are at most 128 objects and 512 KiB of ciphertext per user. IDs are keyed digests; object kind, original ID and value are all encrypted. The server still sees ownership, object counts, sizes and access patterns. AEAD rejects modified ciphertext, but does not prevent a malicious server from deleting data or replaying an earlier valid object. Token-name envelopes are portable across token rotation and are not bound to a particular token ID.
+There are at most 128 private objects and 512 KiB of ciphertext per user. IDs are keyed digests; object kind, original ID and value are all encrypted. The server still sees ownership, object counts, sizes and access patterns. AEAD rejects modified ciphertext, but does not prevent a malicious server from deleting data or replaying an earlier valid object. Token-name envelopes are portable across token rotation and are not bound to a particular token ID.
+
+Custom account labels have been removed. Accounts display issuer-provided email metadata. Previously stored encrypted labels remain untouched for rollback, but are no longer loaded or applied. Token-name encryption and existing dashboard settings remain compatible; no schema or privacy-key change is required.
 
 Dashboard tab, usage period/group and request/token metric selection load and save automatically in encrypted form. Connection host, SSH identity path and standalone state directory remain local connection configuration.
 

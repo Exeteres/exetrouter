@@ -8,7 +8,7 @@ These routes use **ChatGPT Codex OAuth only**, at the existing Codex backend. Th
 
 The unary JSON response contains `created` and one `data` entry with `b64_json` and optionally `generation_id`; other successful response metadata is preserved. The router validates canonical base64 without allocating a second decoded image. It never saves the image or prompt. Clients decode and save the image themselves. A malformed or incomplete upstream response is not successful generation.
 
-Image selection respects active account state, personal activation, operator locks, credential refresh and operational backoff. Known Free-plan credentials are excluded; unknown entitlement is validated upstream. Image models are not fabricated into the conversational model catalog. Image quota is not inferred from the ordinary text quota. A text quota cooldown alone does not block images, and an image rejection does not exhaust ordinary Codex or trigger reset-credit spending.
+Image selection respects active account state, operator policy, credential refresh and operational backoff. Known Free-plan credentials are excluded; unknown entitlement is validated upstream. Image models are not fabricated into the conversational model catalog. Image quota is not inferred from the ordinary text quota. A text quota cooldown alone does not block images, and an image rejection does not exhaust ordinary Codex or trigger reset-credit spending.
 
 ### Agent integration and the native client gate
 

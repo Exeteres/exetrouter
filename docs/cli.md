@@ -1,10 +1,10 @@
 # Client CLI and TUI
 
-The dashboard supports mouse clicks on tabs, account/token/model rows, action menus and bottom controls. Clicking an account or token selects it and opens its actions; clicking a model selects it and copies its ID, just like Enter. Settings actions are inline: Check updates appears first and becomes Update when an update is available; Configure connection is in Connection. Use Up/Down and Enter or click an action. Bottom buttons and action-menu entries display their shortcuts. Buttons wrap on narrow screens; Controls contains navigation hints without repeating button shortcuts. The wheel uses the same selection/scroll behavior as Up/Down. Dialog buttons retain explicit confirmation for token rotation/revocation and updates, and block clicks on the background. Account-label fields support cursor placement. All keyboard controls remain available, with `1`–`5` as direct tab shortcuts. Help accepts `?` or `/` (also the Russian-layout `.`/`,` on the same key). EN/RU command shortcuts work in either layout, including action menus and confirmation dialogs; text fields are not transliterated. Other physical-key layouts cannot be inferred from ordinary terminal character events. Terminal text selection usually requires Shift while mouse capture is active, depending on the terminal. Connection setup and browser sign-in remain keyboard-driven.
+The dashboard supports mouse clicks on tabs, account/token/model rows, action menus and bottom controls. Clicking an account opens its details; clicking a token opens its actions; clicking a model selects it and copies its ID, just like Enter. Settings actions are inline: Check updates appears first and becomes Update when an update is available; Configure connection is in Connection. Use Up/Down and Enter or click an action. Bottom buttons and action-menu entries display their shortcuts. Buttons wrap on narrow screens; Controls contains navigation hints without repeating button shortcuts. The wheel uses the same selection/scroll behavior as Up/Down. Dialog buttons retain explicit confirmation for token rotation/revocation and updates, and block clicks on the background. Token-label fields support cursor placement. All keyboard controls remain available, with `1`–`5` as direct tab shortcuts. Help accepts `?` or `/` (also the Russian-layout `.`/`,` on the same key). EN/RU command shortcuts work in either layout, including action menus and confirmation dialogs; text fields are not transliterated. Other physical-key layouts cannot be inferred from ordinary terminal character events. Terminal text selection usually requires Shift while mouse capture is active, depending on the terminal. Connection setup and browser sign-in remain keyboard-driven.
 
 `exr` runs a standalone API or connects to a shared server on macOS/Linux. Run it without a command to open the dashboard. CLI reports use readable text; add `--json` for scripts.
 
-Token names and personal data are encrypted automatically by the native client. Existing token names are encrypted the next time the token list is loaded. Edit account labels from Overview. See [encrypted personal data](private-metadata.md) for key backup and recovery.
+Token names and dashboard preferences are encrypted automatically by the native client. Existing token names are encrypted the next time the token list is loaded. Accounts display issuer-provided email labels. See [encrypted personal data](private-metadata.md) for key backup and recovery.
 
 ## First run and standalone
 
@@ -46,9 +46,7 @@ exr usage --period 24h
 exr usage --period week --by user
 exr usage --period week --by token
 exr usage --period month --by model --json
-exr account set 1 --enabled false # Reversibly deactivate for this user
-exr account enable 1             # Reactivate; routing is automatic
-exr account set 1 --enabled false # Reversible deactivation for your user
+exr account disable 1 --yes  # Standalone only; reauthorize to enable again
 exr limits                  # Per-account upstream subscription windows
 exr limits --json            # Array of live account limits and reset credits, labeled by email
 exr tokens                  # List your tokens
@@ -75,7 +73,7 @@ Use an interactive terminal at least 72 columns × 20 rows. Press `?` for help o
 
 | View | What you can do |
 | --- | --- |
-| Overview | Inspect routing, limits and recently active clients. Enter opens account details, including token labels and last-request times; Enter again opens activation and personal-label actions. Operator activation locks apply. |
+| Overview | Inspect routing, limits and recently active clients. Enter opens read-only account details, including token labels and last-request times. |
 | Usage | View Today, Last 24 hours, This week or This month, grouped by total, user, model or your API tokens. |
 | Tokens | Create, rename, rotate or revoke tokens. Revoked tokens are hidden. Enter opens actions. |
 | Models | Browse account-visible models and reported limits. Enter copies the selected model ID. |
@@ -85,9 +83,9 @@ Use an interactive terminal at least 72 columns × 20 rows. Press `?` for help o
 
 Tokens: Enter → Rename token (or `l`) edits the selected label. Enter saves, Esc cancels, and Ctrl-U clears the field. Labels must be 1–80 bytes without control characters. Renaming encrypts the new label on the client and changes neither the bearer secret, token ID, expiry nor usage counters; past usage displays the new label on reload. CLI renaming also supports `--json` and requires no clipboard or interactive terminal.
 
-Overview shows a red `Priority` label for enabled accounts with an urgent reset-expiry/weekly-refresh deadline, along with the latest reset outcome. Ordinary reserve accounts have no routing label. `D` toggles activation and `L` edits a personal label. After deactivation, recoverable continuations automatically move to an eligible active account. There are no manual priority, switching-rule or reset-redemption actions. Soft transfers preserve a healthy original account when complete context or an eligible replacement is unavailable. See [automatic selection](account-pool.md#ranking-and-switching).
+Overview shows a red `Priority` label for enabled accounts with an urgent reset-expiry/weekly-refresh deadline, along with the latest reset outcome. Ordinary reserve accounts have no routing label. Account availability belongs to the server operator or standalone Settings; personal activation and custom account labels are not supported. After deactivation, recoverable continuations automatically move to an eligible active account. There are no manual priority, switching-rule or reset-redemption actions. Soft transfers preserve a healthy original account when complete context or an eligible replacement is unavailable. See [automatic selection](account-pool.md#ranking-and-switching).
 
-Green `Best` identifies the preferred general-pool candidate for a new dialog, not the account every request must use. Details explain the reason and approximate target share; model support, cache hints and existing affinity can change selection. `Clients: N` counts your unique API tokens with inference activity on that account in the past 15 minutes, plus tokens with running requests. It does not count connected applications or idle sockets. Details show locally decrypted token labels, token IDs, running-request counts and local last-request times. Use ↑/↓ or PageUp/PageDown to scroll, `r` to refresh, Enter for actions and Esc to close. Other users' tokens are never listed.
+Green `Best` identifies the preferred general-pool candidate for a new dialog, not the account every request must use. Details explain the reason and approximate target share; model support, cache hints and existing affinity can change selection. `Clients: N` counts your unique API tokens with inference activity on that account in the past 15 minutes, plus tokens with running requests. It does not count connected applications or idle sockets. Details show locally decrypted token labels, token IDs, running-request counts and local last-request times. Use ↑/↓ or PageUp/PageDown to scroll, `r` to refresh and Esc to close. Other users' tokens are never listed.
 
 Connection fields support Left/Right, Home/End (Ctrl-A/Ctrl-E), Backspace/Delete and Ctrl-U to clear. Up/Down selects a field. Esc cancels edits; Ctrl-C exits without saving. Remote settings are saved after a successful SSH check.
 
@@ -119,7 +117,7 @@ The client sends its system IANA time zone for Usage calendar boundaries. The se
 
 ## Weekly activation
 
-A fresh weekly window (10080 minutes) with **100% remaining** and a reset exactly seven days after the observation, compared at minute precision, is treated as apparently inactive. Live limits submit one minimal `gpt-5.6-sol` Responses request on that exact account to start the window, then reread usage. The account must be enabled for the authenticated user, operationally available and support this model. A recent ordinary request suppresses activation. Requests use low reasoning, no tools and a fixed short prompt; generated content is discarded. Catalog, Doctor, update checks and the automatic metadata worker remain free of inference.
+A fresh weekly window (10080 minutes) with **100% remaining** and a reset exactly seven days after the observation, compared at minute precision, is treated as apparently inactive. Live limits submit one minimal `gpt-5.6-sol` Responses request on that exact account to start the window, then reread usage. The account must be enabled by operator policy, operationally available and support this model. A recent ordinary request suppresses activation. Requests use low reasoning, no tools and a fixed short prompt; generated content is discarded. Catalog, Doctor, update checks and the automatic metadata worker remain free of inference.
 
 The attempt is recorded before submission and limited to once per account in seven days across users, processes and restarts. Only one activation runs at a time, with a 20-second inference deadline and 64 KiB response limit. Overview and readable limits show the latest attempt status for seven days. Nullable numeric usage is retained and included in total, model and user reports; these requests have no API token and are excluded from token grouping. This pattern is a heuristic, not an upstream guarantee that a zero-percent window is inactive. Schema 8 requires the [migration and rollback plan](quota-activation-migration.md).
 

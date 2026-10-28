@@ -17,15 +17,12 @@ exr account list --json
 exr account add
 exr account reauth ID
 exr account disable ID --yes
-exr account enable ID
-exr account set ID --enabled false
-exr account enable ID
 exr serve
 ```
 
 Standalone data defaults to `$XDG_DATA_HOME/exr` (`~/.local/share/exr`), private mode 0700. `--state-dir PATH` and `--listen 127.0.0.1:PORT` override it. The API runs while the TUI or foreground `exr serve` remains open. Issue a local bearer in Tokens, then use the local `/v1` endpoint in your client. No user/SSH administration is exposed in standalone; the internal owner scope keeps token/usage/affinity semantics consistent.
 
-OAuth add/reauth requires the owner's interactive terminal or TUI Settings browser flow. Never capture real tokens. Enter opens Overview activation/personal-label actions, Tokens actions and Settings actions. Operator activation locks are enforced remotely; deactivation retains OAuth state. Routing and expiring-reset redemption are automatic, with reasons/outcomes in Overview and Limits; there are no manual priority, switching-rule or redemption controls. Short-window subscriptions are used before weekly-only reserves, except urgent reset-expiry/weekly-refresh deadlines within 72 hours. Soft transfers require full recoverable context. Settings supports account selection, add and reauthorize. Operator/server tasks belong to `$exrd`; schema 12 needs the reviewed migration in `docs/automatic-routing-migration.md`.
+OAuth add/reauth requires the owner's interactive terminal or TUI Settings browser flow. Never capture real tokens. Enter opens read-only Overview account details, Tokens actions and Settings actions. Account availability belongs to the operator or standalone Settings; deactivation retains OAuth state, and reauthorization enables a disabled local account again. Routing and expiring-reset redemption are automatic, with reasons/outcomes in Overview and Limits; there are no personal activation/label, manual priority, switching-rule or redemption controls. Short-window subscriptions are used before weekly-only reserves, except urgent reset-expiry/weekly-refresh deadlines within 72 hours. Soft transfers require full recoverable context. Settings supports account selection, add and reauthorize. Operator/server tasks belong to `$exrd`; schema 12 needs the reviewed migration in `docs/automatic-routing-migration.md`.
 
 ## Connection and inspection
 

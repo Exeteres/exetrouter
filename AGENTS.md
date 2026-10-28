@@ -39,7 +39,7 @@ Human-readable output is the default; `--json` is the explicit automation interf
 
 - Put contextual key hints in the bottom Controls area. Navigate left/right across Overview, Usage, Tokens, Models and Settings.
 - Use a borderless header: ExetRouter/version on the left, connection on the right, tabs beneath with one-space selection padding.
-- Enter opens account/token/Settings actions. Enforce operator activation locks on the server. Deactivation is reversible and retains OAuth state. Account routing and expiring reset credits are automatic; do not reintroduce manual priority, switching-rule or redemption controls.
+- Enter opens read-only account details or token/Settings actions. Enforce operator availability on the server and preserve existing lock metadata. Deactivation is reversible and retains OAuth state. Account routing and expiring reset credits are automatic; do not reintroduce personal account activation/labels, manual priority, switching-rule or redemption controls.
 - Highlight Settings for client updates; server updates belong to the operator.
 - Check clipboard support before token issuance/rotation, then copy secrets without rendering them.
 
