@@ -4,7 +4,7 @@ See the [installation guide](installation.md) and [Linux deployment guide](../de
 
 ## Identity and secrets
 
-Router bearers are user-scoped, stored by HMAC and returned once on creation/rotation to an interactive client, which copies them to the clipboard without rendering them. Revocation is checked before each generation, including subsequent WS response.create. Remote users cannot create users, obtain upstream credentials or manage another user's tokens. Shared usage consists of aggregate metadata.
+Router bearers are user-scoped, stored by HMAC and returned once on creation/rotation to an interactive client, which copies them to the clipboard without rendering them. Revocation is checked before each generation, including subsequent WS response.create. Remote users cannot create users, obtain upstream credentials or manage another user's tokens. Shared usage consists of aggregate metadata; account presence additionally exposes pseudonymous client activity without foreign token names, raw token IDs or user identities.
 
 ChatGPT OAuth credentials are XChaCha20-Poly1305 encrypted with account-bound associated data. The 0600 OAuth key is separate from the bearer HMAC key; equal keys are rejected. Refresh uses a lease and generation compare-and-swap; stale refresh cannot overwrite reauth. Terminal refresh failure requires operator login. No upstream API-key BYOK is implemented.
 

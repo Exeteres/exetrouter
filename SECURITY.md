@@ -46,6 +46,8 @@ Use separate unprivileged service/gateway UIDs, protected state/keys and reviewe
 
 Management exposes account identities, usage totals, model IDs and operational metadata, never conversations or request bodies. Content passes through memory after TLS termination. A host operator can inspect memory or replace software, so this is not end-to-end confidentiality against that operator. Connect directly to a trusted provider if that property is required.
 
+Account client-presence reports share server-wide token counts and pseudonymous last-request/running activity with authenticated management users. Viewers receive their own token IDs and encrypted names; other users' clients expose only domain-separated keyed aliases and timing/count metadata, never names, ciphertext, raw token IDs or user identities. Token management and detailed per-token usage remain user-scoped.
+
 [Personal metadata](docs/private-metadata.md) uses a separate client-held key created automatically by the native client. Existing plaintext token names are encrypted when the native client next loads them; server snapshots do not contain the client key. Confidentiality depends on a trusted client/device, and does not hide access patterns or prevent server rollback/deletion.
 
 ## Verification and publication

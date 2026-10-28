@@ -8,6 +8,8 @@ New token names are encrypted automatically in CLI and TUI. Rotation preserves c
 
 Rename a token through Tokens → Enter → Rename token or `exr tokens rename ID "New label"`. The client verifies the existing encrypted name before replacing it and encrypts the new label without changing the secret or usage history. User-scoped token usage reports carry the current stored label, including for revoked tokens; only the client decrypts it. A missing/wrong key displays `Label unavailable` in Usage instead of ciphertext or a token fragment. Other usage groupings never include token labels.
 
+Account `Clients` is server-wide presence metadata. Only the viewer's own token IDs and stored names are returned for local decryption. Other users' clients carry keyed anonymous aliases, last-request times and running-request counts, never names, ciphertext, raw token IDs or user identities. This does not share the privacy key or grant access to another user's tokens or detailed usage.
+
 Before migrating plaintext names, the client verifies that it can decrypt every encrypted name in the list. An unavailable privacy key does not block unrelated management operations such as model/usage reports or token revocation.
 
 There are at most 128 private objects and 512 KiB of ciphertext per user. IDs are keyed digests; object kind, original ID and value are all encrypted. The server still sees ownership, object counts, sizes and access patterns. AEAD rejects modified ciphertext, but does not prevent a malicious server from deleting data or replaying an earlier valid object. Token-name envelopes are portable across token rotation and are not bound to a particular token ID.
